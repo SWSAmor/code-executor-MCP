@@ -1,4 +1,5 @@
 import { spawn } from 'child_process';
+import { isCompiledBinary } from './runtime-detect.js';
 
 /**
  * SelfInstaller - Detects and installs code-executor-mcp globally
@@ -108,8 +109,13 @@ Or configure npm to use a user-writable directory: https://docs.npmjs.com/resolv
    * @throws Error with remediation message if installation fails
    */
   async runBootstrap(): Promise<void> {
+    if (isCompiledBinary()) {
+      console.log('📦 Running as compiled binary — skipping npm self-install.');
+      return;
+    }
+
     console.log('🔍 Checking if code-executor-mcp is globally installed...');
-    
+
     const isInstalled = await this.detectGlobalInstall();
     
     if (isInstalled) {

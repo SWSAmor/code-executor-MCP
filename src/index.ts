@@ -21,7 +21,9 @@ import { ConnectionPool } from './mcp/connection-pool.js';
 import { RateLimiter } from './security/rate-limiter.js';
 import { executeTypescriptInSandbox } from './executors/sandbox-executor.js';
 import { executePythonInSandbox as executePythonNative } from './executors/python-executor.js';
-import { executePythonInSandbox as executePythonPyodide } from './executors/pyodide-executor.js';
+// Pyodide is loaded lazily — only imported when PYTHON_SANDBOX_READY=true.
+// This keeps the 13MB pyodide WASM out of `bun --compile` binaries that don't need it.
+type ExecutePythonPyodideFn = typeof import('./executors/pyodide-executor.js').executePythonInSandbox;
 import { formatErrorResponse, formatExecutionResultForCli } from './utils/utils.js';
 import { ErrorType } from './types.js';
 import { checkDenoAvailable, getDenoVersion, getDenoInstallMessage } from './executors/deno-checker.js';
@@ -537,9 +539,14 @@ Example:
 
           // Execute code with connection pooling
           // Use Pyodide (secure) when PYTHON_SANDBOX_READY, otherwise native (insecure)
-          const executePythonInSandbox = PYTHON_SANDBOX_READY
-            ? executePythonPyodide
-            : executePythonNative;
+          // Pyodide loaded lazily so its 13MB WASM stays out of compiled binaries that don't enable it.
+          let executePythonInSandbox: ExecutePythonPyodideFn;
+          if (PYTHON_SANDBOX_READY) {
+            const pyodideMod = await import('./executors/pyodide-executor.js');
+            executePythonInSandbox = pyodideMod.executePythonInSandbox;
+          } else {
+            executePythonInSandbox = executePythonNative;
+          }
 
           const result = await this.connectionPool.execute(async () => {
             return await executePythonInSandbox(
@@ -801,7 +808,9 @@ Returns:
 
 // Export functions for testing
 export { executeTypescriptInSandbox as executeTypescript } from './executors/sandbox-executor.js';
-export { executePythonInSandbox as executePython } from './executors/pyodide-executor.js';
+// Pyodide export kept as a type-only re-export at the top of this file; consumers
+// who need the runtime should `import('code-executor-mcp/dist/executors/pyodide-executor.js')`
+// directly. Avoiding a static re-export keeps pyodide out of `bun --compile` graphs.
 
 // Start server
 const server = new CodeExecutorServer();

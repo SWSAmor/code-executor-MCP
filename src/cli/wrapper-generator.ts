@@ -20,6 +20,7 @@ import type {
   ModuleFormat,
   ToolSchema,
 } from './types.js';
+import { loadTemplate, type TemplateName } from './templates/loader.js';
 
 /**
  * WrapperGeneratorOptions - Configuration for WrapperGenerator
@@ -361,18 +362,10 @@ export class WrapperGenerator {
       // Ensure output directory exists
       await fs.mkdir(languageDir, { recursive: true });
 
-      // Load template
-      const templatePath = path.join(
-        this.templateDir,
-        language === 'typescript' ? 'typescript-wrapper.hbs' : 'python-wrapper.hbs'
-      );
-
-      const templateSource = await fs.readFile(templatePath, 'utf-8').catch((error: unknown) => {
-        if (error && typeof error === 'object' && 'code' in error && error.code === 'ENOENT') {
-          throw new Error(`Template not found: ${templatePath}`);
-        }
-        throw error;
-      });
+      // Load template — filesystem first, embedded fallback for compiled binary
+      const templateName: TemplateName =
+        language === 'typescript' ? 'typescript-wrapper.hbs' : 'python-wrapper.hbs';
+      const templateSource = await loadTemplate(templateName, this.templateDir);
 
       // Compile template with auto-escaping enabled (CVE-2021-23369 mitigation)
       const template = this.handlebars.compile(templateSource, {

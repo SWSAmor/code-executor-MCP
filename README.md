@@ -81,12 +81,31 @@ Traditional MCP exposes all 47 tools upfront (141k tokens). Code Executor expose
 
 ### Option 1: Interactive Setup Wizard (Recommended)
 
-Don't configure manually. Our wizard does everything:
+Don't configure manually. Our wizard does everything.
 
+**Via npm (Node.js 22+):**
 ```bash
 npm install -g code-executor-mcp
 code-executor-mcp setup
 ```
+
+**Via bun (Bun 1.1+):**
+```bash
+bunx code-executor-mcp setup
+```
+
+**Via standalone binary (no Node.js or Bun required):**
+
+Download the binary for your platform from the [Releases page](https://github.com/aberemia24/code-executor-MCP/releases) and run it directly:
+```bash
+# macOS (Apple Silicon)
+curl -L -o code-executor-mcp https://github.com/aberemia24/code-executor-MCP/releases/latest/download/code-executor-mcp-darwin-arm64
+chmod +x code-executor-mcp
+./code-executor-mcp setup
+```
+Available targets: `darwin-arm64`, `darwin-x64`, `linux-x64`, `linux-arm64`, `windows-x64`.
+
+The binary still needs **Deno** (for TypeScript sandbox) and **Python 3** (for native Python sandbox) on `PATH`. The setup wizard verifies these and shows install instructions if missing.
 
 **What the wizard does:**
 1. 🔍 Scans for existing MCP configs (Claude Code `~/.claude.json`, Cursor `~/.cursor/mcp.json`, project `.mcp.json`)

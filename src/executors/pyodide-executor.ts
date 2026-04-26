@@ -14,7 +14,9 @@
  * Issue #59: Pyodide WebAssembly sandbox for Python execution
  */
 
-import { loadPyodide, type PyodideInterface } from 'pyodide';
+// Pyodide is loaded via dynamic import so `bun --compile` binaries that don't
+// enable PYTHON_SANDBOX_READY don't pull the 13MB WASM bundle into the binary.
+type PyodideInterface = import('pyodide').PyodideInterface;
 import { Server as McpServer } from '@modelcontextprotocol/sdk/server/index.js';
 import { MCPProxyServer } from '../core/server/mcp-proxy-server.js';
 import { StreamingProxy } from '../core/middleware/streaming-proxy.js';
@@ -44,6 +46,7 @@ async function getPyodide(): Promise<PyodideInterface> {
 
     // Node.js: Use npm package files (no indexURL needed)
     // The pyodide npm package includes all necessary files locally
+    const { loadPyodide } = await import('pyodide');
     pyodideCache = await loadPyodide({
       // SECURITY: Disable stdin to prevent interactive prompts
       stdin: () => {

@@ -1,0 +1,110 @@
+name: Release Binaries
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag to build (e.g. v1.0.6)'
+        required: true
+
+jobs:
+  build:
+    name: Build ${{ matrix.target }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: darwin-arm64
+            runner: macos-14
+            outfile: code-executor-mcp-darwin-arm64
+            bun_target: bun-darwin-arm64
+          - target: darwin-x64
+            runner: macos-13
+            outfile: code-executor-mcp-darwin-x64
+            bun_target: bun-darwin-x64
+          - target: linux-x64
+            runner: ubuntu-latest
+            outfile: code-executor-mcp-linux-x64
+            bun_target: bun-linux-x64
+          - target: linux-arm64
+            runner: ubuntu-22.04-arm
+            outfile: code-executor-mcp-linux-arm64
+            bun_target: bun-linux-arm64
+          - target: windows-x64
+            runner: windows-latest
+            outfile: code-executor-mcp-windows-x64.exe
+            bun_target: bun-windows-x64
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Embed templates
+        run: bun run embed-templates
+
+      - name: Build binary
+        shell: bash
+        run: |
+          mkdir -p bin
+          bun build --compile --minify --sourcemap --external pyodide \
+            --target=${{ matrix.bun_target }} \
+            src/index.ts \
+            --outfile=bin/${{ matrix.outfile }}
+
+      - name: Smoke test (host targets only)
+        if: matrix.target == 'darwin-arm64' || matrix.target == 'linux-x64'
+        shell: bash
+        run: |
+          ./bin/${{ matrix.outfile }} --help 2>&1 | head -5 || true
+          file ./bin/${{ matrix.outfile }}
+          ls -lh ./bin/${{ matrix.outfile }}
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.outfile }}
+          path: bin/${{ matrix.outfile }}
+          if-no-files-found: error
+
+  release:
+    name: Create GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/v')
+    permissions:
+      contents: write
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Flatten artifact directories
+        run: |
+          mkdir -p release
+          find artifacts -type f -exec cp {} release/ \;
+          ls -lh release/
+
+      - name: Create checksums
+        working-directory: release
+        run: |
+          shasum -a 256 * > SHA256SUMS
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: release/*
+          generate_release_notes: true
+          fail_on_unmatched_files: true
