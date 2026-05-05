@@ -352,7 +352,7 @@ export class DailySyncService {
    */
   private convertToCLIToolSchema(discoveryTool: DiscoveryToolSchema): CLIToolSchema {
     // Extract inputSchema as object, defaulting to empty if not present
-    const params = discoveryTool.inputSchema || {};
+    const params = discoveryTool.parameters || {};
 
     // Type guard: Check if params has properties and required fields
     const hasProperties = typeof params === 'object' && params !== null && 'properties' in params;
