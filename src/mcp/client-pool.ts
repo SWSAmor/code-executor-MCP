@@ -157,6 +157,7 @@ export class MCPClientPool implements IToolSchemaProvider {
         console.error(`📂 Merging ${configPaths.length} MCP configs: ${configPaths.map(p => p.split('/').pop()).join(' → ')}`);
 
         const mergedServers: Record<string, MCPServerConfig> = {};
+        const mergedExcludeServers: Set<string> = new Set();
 
         for (const configPath of configPaths) {
           try {
@@ -165,6 +166,13 @@ export class MCPClientPool implements IToolSchemaProvider {
 
             // Merge mcpServers (later configs override earlier)
             Object.assign(mergedServers, parsedConfig.mcpServers || {});
+
+            // Accumulate excludeServers from all configs (union, not override)
+            if (Array.isArray(parsedConfig.excludeServers)) {
+              for (const name of parsedConfig.excludeServers) {
+                mergedExcludeServers.add(name);
+              }
+            }
           } catch (error) {
             // TYPE-001 fix: Use normalizeError for consistency
             const err = normalizeError(error);
@@ -172,15 +180,35 @@ export class MCPClientPool implements IToolSchemaProvider {
           }
         }
 
-        config = { mcpServers: mergedServers };
+        config = {
+          mcpServers: mergedServers,
+          ...(mergedExcludeServers.size > 0 && { excludeServers: [...mergedExcludeServers] }),
+        };
       }
 
-      // Filter out code-executor to prevent circular dependency
+      // Build exclusion set: always exclude self + user-configured exclusions + env var
+      const excludeSet = new Set<string>(['code-executor']);
+      if (config.excludeServers) {
+        for (const name of config.excludeServers) {
+          excludeSet.add(name);
+        }
+      }
+      const envExclude = process.env.EXCLUDE_MCP_SERVERS;
+      if (envExclude) {
+        for (const name of envExclude.split(',').map(s => s.trim()).filter(Boolean)) {
+          excludeSet.add(name);
+        }
+      }
+
       const filteredServers = Object.entries(config.mcpServers).filter(
-        ([serverName]) => serverName !== 'code-executor'
+        ([serverName]) => !excludeSet.has(serverName)
       );
 
-      console.error(`🔌 Initializing MCP client pool (excluding self, ${filteredServers.length} servers)`);
+      const userExclusions = [...excludeSet].filter(n => n !== 'code-executor');
+      if (userExclusions.length > 0) {
+        console.error(`🚫 Excluding MCP servers: ${userExclusions.join(', ')}`);
+      }
+      console.error(`🔌 Initializing MCP client pool (excluding self${userExclusions.length > 0 ? ` + ${userExclusions.length} excluded` : ''}, ${filteredServers.length} servers)`);
 
       // Connect to each configured server with detailed error tracking
       const serverNames = filteredServers.map(([name]) => name);

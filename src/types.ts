@@ -167,6 +167,8 @@ export interface ProcessInfo {
 export interface MCPConfig {
   /** Map of server name to configuration */
   mcpServers: Record<string, MCPServerConfig>;
+  /** Server names to exclude from loading (in addition to self-exclusion) */
+  excludeServers?: string[];
 }
 
 /**
