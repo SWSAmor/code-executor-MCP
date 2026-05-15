@@ -3,6 +3,8 @@ node_modules/
 
 # Build output
 dist/
+bin/
+.*.bun-build
 
 # Test coverage
 coverage/

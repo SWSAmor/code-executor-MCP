@@ -815,14 +815,14 @@ export class CLIWizard {
   async generateVSCodeTasks(projectRoot: string): Promise<void> {
     const fs = await import('fs/promises');
     const path = await import('path');
+    const { loadTemplate } = await import('./templates/loader.js');
 
     // Create .vscode directory if it doesn't exist
     const vscodeDir = path.join(projectRoot, '.vscode');
     await fs.mkdir(vscodeDir, { recursive: true });
 
-    // Read template
-    const templatePath = path.join(__dirname, '..', '..', 'templates', 'vscode-tasks.json');
-    const templateContent = await fs.readFile(templatePath, 'utf8');
+    // Load template — embedded constant (small, never edited at runtime)
+    const templateContent = await loadTemplate('vscode-tasks.json');
     const templateTasks = JSON.parse(templateContent);
 
     // Check if tasks.json already exists
