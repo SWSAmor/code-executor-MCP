@@ -738,6 +738,50 @@ Docker deployment automatically generates complete MCP configuration from enviro
 
 See [DOCKER_TESTING.md](DOCKER_TESTING.md) for security details and [docker-compose.example.yml](docker-compose.example.yml) for all available configuration options.
 
+### Build Standalone Binary (from Source)
+
+To produce the single-file binary locally — useful for development, custom patches, or self-contained deployment without npm/Node on `PATH`:
+
+```bash
+git clone https://github.com/aberemia24/code-executor-MCP.git
+cd code-executor-MCP
+npm install
+
+# Host target only (current platform) → ./bin/code-executor-mcp (~63 MB)
+npm run build:binary
+
+# Or cross-compile to all five targets:
+#   bin/code-executor-mcp-darwin-arm64
+#   bin/code-executor-mcp-darwin-x64
+#   bin/code-executor-mcp-linux-x64
+#   bin/code-executor-mcp-linux-arm64
+#   bin/code-executor-mcp-windows-x64.exe
+npm run build:binary:all
+```
+
+**Requirements:** Bun 1.1+ on `PATH` (the `npm run` scripts invoke `bun build --compile`). Templates are embedded at build time via `scripts/embed-templates.ts` (auto-run before the compile step). Pyodide is excluded from the binary to keep size down; the npm/`npx` install path keeps Pyodide available if you need it.
+
+**Wire the binary into `mcpServers`** (replace `npx`/`node` with the absolute path):
+
+```json
+{
+  "mcpServers": {
+    "code-executor": {
+      "command": "/absolute/path/to/code-executor-MCP/bin/code-executor-mcp",
+      "args": [],
+      "env": {
+        "MCP_CONFIG_PATH": "/full/path/to/.mcp.json",
+        "DENO_PATH": "/opt/homebrew/bin/deno",
+        "ENABLE_AUDIT_LOG": "true",
+        "AUDIT_LOG_PATH": "/Users/you/.code-executor/audit.log"
+      }
+    }
+  }
+}
+```
+
+Compared to `npx -y code-executor-mcp`: no Node.js needed on `PATH`, faster cold-start (no npm resolution/extraction), and a single artifact you can pin and ship alongside your config.
+
 ### Local Development
 
 ```bash
