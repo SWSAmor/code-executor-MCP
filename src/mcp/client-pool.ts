@@ -10,6 +10,7 @@ import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js'
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
 import { SSEClientTransport } from '@modelcontextprotocol/sdk/client/sse.js';
 import { EventEmitter } from 'events';
+import { execFileSync } from 'child_process';
 import * as fs from 'fs/promises';
 import { getPoolConfig } from '../config/loader.js';
 import { isValidMCPToolName, normalizeError, isErrnoException } from '../utils/utils.js';
@@ -78,6 +79,14 @@ export class MCPClientPool implements IToolSchemaProvider {
   // otherwise these children leak as orphans on a mid-init shutdown/kill.
   private pendingStdioTransports: Set<StdioClientTransport> = new Set();
 
+  // Recursion guard. A code-executor wired (directly, or indirectly via another
+  // MCP host such as its own agent gateway) as a downstream server of another
+  // code-executor forms a spawn cycle that fork-bombs the machine. Name-based
+  // self-exclusion cannot catch the indirect case (the intermediary is a
+  // different program). Instead, at startup we walk the parent-PID chain and run
+  // in LEAF MODE (connect to no downstream servers) if any ancestor is itself a
+  // code-executor process. See hasCodeExecutorAncestor().
+
   // US4: Concurrency limiting and overflow queue
   private maxConcurrent: number;
   private activeConcurrent = 0;
@@ -123,10 +132,83 @@ export class MCPClientPool implements IToolSchemaProvider {
   }
 
   /**
+   * Walk this process's parent-PID chain and report whether any ancestor is
+   * itself a code-executor process. This is what breaks the cycle: a
+   * code-executor nested under another (directly, or via an intermediate MCP
+   * host) detects the ancestor and runs in leaf mode.
+   *
+   * Why walk the live process table instead of an inherited env marker: the
+   * intermediary (observed: an agent gateway's `mcp serve`) does NOT forward
+   * our environment to the children it spawns, so a marker never reaches the
+   * nested instance. Parent PIDs, by contrast, are always there to read.
+   *
+   * Why the whole chain, not just the direct parent: in the cyclic case the
+   * direct parent is the host (e.g. hermes), not a code-executor — the
+   * code-executor ancestor is one hop further up.
+   *
+   * Matching is on the ancestor's argv0 basename only (not the whole command
+   * line), so a shell wrapper like `sh -c "... /path/code-executor-mcp ..."`
+   * (whose argv0 is "sh") is not mistaken for a code-executor.
+   *
+   * Best-effort: returns false if `ps` is unavailable (e.g. Windows) or the
+   * query fails.
+   */
+  private static hasCodeExecutorAncestor(): boolean {
+    const SELF_BINARY = 'code-executor-mcp';
+    try {
+      let pid = process.ppid;
+      let hops = 0;
+      while (pid && pid > 1 && hops < 64) {
+        hops++;
+        const out = execFileSync('ps', ['-o', 'ppid=,command=', '-p', String(pid)], {
+          encoding: 'utf8',
+          timeout: 2000,
+        }).trim();
+        if (!out) {
+          break;
+        }
+        const spaceIdx = out.indexOf(' ');
+        const ppidStr = spaceIdx === -1 ? out : out.slice(0, spaceIdx);
+        const command = spaceIdx === -1 ? '' : out.slice(spaceIdx + 1);
+        // argv0 = first whitespace-delimited token; compare its basename.
+        const argv0 = command.split(/\s+/)[0] ?? '';
+        const argv0Base = argv0.split('/').pop() ?? '';
+        if (argv0Base === SELF_BINARY) {
+          return true;
+        }
+        const nextPid = Number.parseInt(ppidStr, 10);
+        if (!Number.isFinite(nextPid) || nextPid === pid) {
+          break;
+        }
+        pid = nextPid;
+      }
+    } catch {
+      // ps unavailable / query failed — guard simply does not engage here.
+    }
+    return false;
+  }
+
+  /**
    * Initialize client pool by reading config and connecting to servers
    */
   async initialize(configPath?: string): Promise<void> {
     if (this.initialized) {
+      return;
+    }
+
+    // Recursion guard: if this code-executor is itself nested under another
+    // code-executor — directly, or indirectly via an MCP host such as an agent
+    // gateway — do NOT connect to any downstream servers, to prevent a spawn
+    // cycle that would fork-bomb the machine.
+    const allowNested = process.env.CODE_EXECUTOR_ALLOW_NESTED === '1'
+      || process.env.CODE_EXECUTOR_ALLOW_NESTED === 'true';
+    if (!allowNested && MCPClientPool.hasCodeExecutorAncestor()) {
+      console.error(
+        `🛑 Nested code-executor detected (a code-executor process is an ancestor — ` +
+        `cyclic MCP topology) — running in LEAF MODE: not connecting to any downstream ` +
+        `MCP servers, to prevent a spawn cycle. Set CODE_EXECUTOR_ALLOW_NESTED=1 to override.`
+      );
+      this.initialized = true;
       return;
     }
 
