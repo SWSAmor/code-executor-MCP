@@ -46,6 +46,8 @@ export interface MCPClientPoolConfig {
   queueSize?: number;
   /** Queue timeout in milliseconds (default: 30000ms = 30s) */
   queueTimeoutMs?: number;
+  /** Per-server connect timeout in milliseconds (default: 15000ms = 15s) */
+  connectTimeoutMs?: number;
 }
 
 /**
@@ -64,6 +66,17 @@ export class MCPClientPool implements IToolSchemaProvider {
   private toolCache: Map<string, ToolInfo> = new Map();
   private processes: Map<string, ProcessInfo> = new Map();
   private initialized = false;
+
+  // Per-server connect timeout: a single slow/unreachable downstream server must
+  // never stall pool startup (which would delay the upstream MCP handshake and
+  // trigger a supervisor restart loop). See connectStdio/connectHttp.
+  private connectTimeoutMs: number;
+
+  // STDIO transports that have spawned a child process but whose connect() has
+  // not yet resolved. Tracked here so a child can still be reaped if the whole
+  // pool is torn down (or the process exits) before connect() completes —
+  // otherwise these children leak as orphans on a mid-init shutdown/kill.
+  private pendingStdioTransports: Set<StdioClientTransport> = new Set();
 
   // US4: Concurrency limiting and overflow queue
   private maxConcurrent: number;
@@ -90,6 +103,9 @@ export class MCPClientPool implements IToolSchemaProvider {
 
     // T053: Store queue timeout for waitForQueueSlot
     this.queueTimeoutMs = config?.queueTimeoutMs ?? poolConfig.queueTimeoutMs;
+
+    // Per-server connect timeout (Priority: explicit config > env-validated default)
+    this.connectTimeoutMs = config?.connectTimeoutMs ?? poolConfig.connectTimeoutMs;
 
     // T053: Initialize connection queue
     this.connectionQueue = new ConnectionQueue({
@@ -210,57 +226,64 @@ export class MCPClientPool implements IToolSchemaProvider {
       }
       console.error(`🔌 Initializing MCP client pool (excluding self${userExclusions.length > 0 ? ` + ${userExclusions.length} excluded` : ''}, ${filteredServers.length} servers)`);
 
-      // Connect to each configured server with detailed error tracking
+      // Connect to each configured server. Each connection is independent and
+      // bounded by connectTimeoutMs (see connectToServer), so one slow/unreachable
+      // server can never block the others — failures degrade gracefully and the
+      // pool comes up with whatever connected. A failed server is NEVER added to
+      // `clients`/`toolCache`, so its tools are not discoverable or callable.
       const serverNames = filteredServers.map(([name]) => name);
-      const connections = filteredServers.map(
-        ([serverName, serverConfig]) =>
-          this.connectToServer(serverName, serverConfig)
+      const outcomes = await Promise.all(
+        filteredServers.map(async ([serverName, serverConfig]) => {
+          const startedAt = Date.now();
+          try {
+            await this.connectToServer(serverName, serverConfig);
+            return { serverName, ok: true as const, ms: Date.now() - startedAt };
+          } catch (error) {
+            return {
+              serverName,
+              ok: false as const,
+              ms: Date.now() - startedAt,
+              error: error instanceof Error ? error.message : String(error),
+            };
+          }
+        })
       );
 
-      const results = await Promise.allSettled(connections);
+      const failures = outcomes.filter(o => !o.ok);
+      const successes = outcomes.length - failures.length;
 
-      // Track failures
-      const failures = results.filter(r => r.status === 'rejected');
+      // Per-server startup status report: one line per configured server (so a
+      // 9-server config produces 9 lines), with the failure reason when known.
+      // This is the authoritative record of what came up and what did not.
+      if (serverNames.length === 0) {
+        console.error('ℹ️  No other MCP servers configured (code-executor running standalone)');
+      } else {
+        console.error(`📋 MCP server startup report (${successes}/${serverNames.length} connected):`);
+        for (const o of outcomes) {
+          if (o.ok) {
+            console.error(`  ✓ ${o.serverName} (${o.ms}ms)`);
+          } else {
+            console.error(`  ✗ ${o.serverName} (${o.ms}ms): ${o.error}`);
+          }
+        }
+      }
 
-      // If ALL servers failed (and there were servers to connect to), throw error
-      // Allow zero servers as valid configuration (code-executor can run standalone)
+      // If ALL servers failed (and there were servers to connect to), throw error.
+      // Allow zero servers as a valid configuration (code-executor runs standalone).
       if (serverNames.length > 0 && failures.length === serverNames.length) {
-        const errorMessages = results
-          .map((r, i) => {
-            if (r.status === 'rejected') {
-              return `  - ${serverNames[i]}: ${r.reason instanceof Error ? r.reason.message : String(r.reason)}`;
-            }
-            return '';
-          })
-          .filter(Boolean)
+        const errorMessages = failures
+          .map(o => `  - ${o.serverName}: ${o.error}`)
           .join('\n');
-
         throw new Error(
           `All MCP server connections failed. Check .mcp.json configuration:\n${errorMessages}`
         );
       }
 
-      // If zero servers configured, log info message
-      if (serverNames.length === 0) {
-        console.error('ℹ️  No other MCP servers configured (code-executor running standalone)');
-      }
-
-      // If some servers failed, warn but continue
       if (failures.length > 0) {
-        console.warn(`⚠️  ${failures.length}/${serverNames.length} MCP servers failed to connect`);
-        failures.forEach((f, i) => {
-          if (f.status === 'rejected') {
-            const serverName = serverNames[i];
-            console.error(`  ✗ ${serverName}: ${f.reason instanceof Error ? f.reason.message : String(f.reason)}`);
-          }
-        });
+        console.warn(`⚠️  ${failures.length}/${serverNames.length} MCP servers failed to connect — continuing without them`);
       }
 
-      // Report successful connections
-      const successes = results.filter(r => r.status === 'fulfilled').length;
-      console.error(`✓ Connected to ${successes}/${serverNames.length} MCP servers`);
-
-      // Cache tool listings
+      // Cache tool listings (only from successfully connected servers)
       await this.cacheToolListings();
 
       this.initialized = true;
@@ -279,6 +302,43 @@ export class MCPClientPool implements IToolSchemaProvider {
       await this.connectHttp(serverName, config);
     } else {
       throw new Error(`Unknown transport type for server: ${serverName}`);
+    }
+  }
+
+  /**
+   * Race a client.connect() against connectTimeoutMs.
+   *
+   * On timeout (or connect rejection) the error is propagated to the caller,
+   * which owns transport/child teardown. The still-pending connect promise is
+   * detached with a no-op catch so a late rejection cannot surface as an
+   * unhandled rejection after we have moved on.
+   */
+  private async connectWithTimeout(
+    client: Client,
+    transport: Parameters<Client['connect']>[0],
+    serverName: string
+  ): Promise<void> {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const connectPromise = client.connect(transport);
+    const timeoutPromise = new Promise<never>((_, reject) => {
+      timer = setTimeout(
+        () => reject(new Error(`connect timed out after ${this.connectTimeoutMs}ms`)),
+        this.connectTimeoutMs
+      );
+    });
+
+    try {
+      await Promise.race([connectPromise, timeoutPromise]);
+    } catch (error) {
+      // Detach the losing connect promise so a late rejection is swallowed.
+      void connectPromise.catch(() => { /* superseded by timeout/failure */ });
+      throw error instanceof Error
+        ? error
+        : new Error(`Failed to connect to ${serverName}: ${String(error)}`);
+    } finally {
+      if (timer) {
+        clearTimeout(timer);
+      }
     }
   }
 
@@ -307,10 +367,35 @@ export class MCPClientPool implements IToolSchemaProvider {
       },
     });
 
-    // Connect to server
-    await client.connect(transport);
+    // Track the transport BEFORE connecting: connect() spawns the child process,
+    // so if connect hangs (or the pool is torn down mid-init) we must still be
+    // able to reap that child via this set. Removed once connect settles.
+    this.pendingStdioTransports.add(transport);
 
-    // Track process for cleanup
+    try {
+      await this.connectWithTimeout(client, transport, serverName);
+    } catch (error) {
+      // Capture the spawned child PID before close() clears it, then tear the
+      // child down explicitly (SIGKILL) so a slow/failed server leaves no orphan.
+      // Explicit kill-by-PID is used in addition to transport.close() because the
+      // AbortController-based kill is not reliable across runtimes (e.g. Bun).
+      const orphanPid = transport.pid;
+      this.pendingStdioTransports.delete(transport);
+      void transport.close().catch(() => { /* best effort */ });
+      void client.close().catch(() => { /* best effort */ });
+      if (orphanPid != null) {
+        try {
+          process.kill(orphanPid, 'SIGKILL');
+        } catch {
+          // ESRCH (already gone) or not-permitted — nothing more to do.
+        }
+      }
+      throw error;
+    }
+
+    this.pendingStdioTransports.delete(transport);
+
+    // Track process for graceful cleanup on shutdown
     if (transport.pid) {
       this.processes.set(serverName, {
         pid: transport.pid,
@@ -351,7 +436,7 @@ export class MCPClientPool implements IToolSchemaProvider {
           },
         }
       );
-      await client.connect(transport);
+      await this.connectWithTimeout(client, transport, serverName);
       connected = true;
       console.error(`✓ Connected to ${serverName} via StreamableHTTP`);
     } catch {
@@ -368,7 +453,7 @@ export class MCPClientPool implements IToolSchemaProvider {
           },
         }
       );
-      await client.connect(transport);
+      await this.connectWithTimeout(client, transport, serverName);
       console.error(`✓ Connected to ${serverName} via SSE (fallback)`);
     }
 
@@ -781,6 +866,28 @@ export class MCPClientPool implements IToolSchemaProvider {
 
     await Promise.all(processCleanup);
 
+    // Close any transports whose connect() is still in flight (mid-init shutdown).
+    // These are not yet in `processes`, so without this their children would leak.
+    const pendingCleanup = Array.from(this.pendingStdioTransports).map(
+      async (transport) => {
+        const pid = transport.pid;
+        try {
+          await transport.close();
+        } catch {
+          // best effort
+        }
+        if (pid != null) {
+          try {
+            process.kill(pid, 'SIGKILL');
+          } catch {
+            // already gone / not permitted
+          }
+        }
+      }
+    );
+    await Promise.all(pendingCleanup);
+    this.pendingStdioTransports.clear();
+
     // Clear all state
     this.clients.clear();
     this.toolCache.clear();
@@ -791,6 +898,34 @@ export class MCPClientPool implements IToolSchemaProvider {
     // During shutdown, there may be queued requests still waiting for slot notifications.
     // Removing listeners ensures clean shutdown without dangling event handlers.
     this.queueSlotEmitter.removeAllListeners();
+  }
+
+  /**
+   * Synchronously SIGKILL every child process this pool has spawned.
+   *
+   * Last-resort backstop for `process.on('exit')`, where only synchronous work
+   * runs: async disconnect() cannot complete there. Covers both fully-connected
+   * STDIO servers (`processes`) and connects still in flight (`pendingStdioTransports`),
+   * so a hard exit never leaves orphaned downstream MCP processes behind.
+   */
+  killChildrenSync(): void {
+    const pids = new Set<number>();
+    for (const { pid } of this.processes.values()) {
+      pids.add(pid);
+    }
+    for (const transport of this.pendingStdioTransports) {
+      const pid = transport.pid;
+      if (pid != null) {
+        pids.add(pid);
+      }
+    }
+    for (const pid of pids) {
+      try {
+        process.kill(pid, 'SIGKILL');
+      } catch {
+        // already gone / not permitted — nothing to do in a sync exit handler
+      }
+    }
   }
 
   /**

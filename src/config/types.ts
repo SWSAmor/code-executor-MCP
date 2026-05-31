@@ -28,6 +28,8 @@ export type RateLimitConfig = z.infer<typeof RateLimitConfigSchema>;
  * - maxConcurrent: 1-1000 balances throughput vs resource consumption
  * - queueSize: 1-1000 prevents memory exhaustion from unbounded queues
  * - queueTimeoutMs: 1s-5min ensures reasonable wait times
+ * - connectTimeoutMs: 1s-2min caps how long a single downstream MCP server may
+ *   take to connect, so one slow/unreachable server cannot stall pool startup
  */
 export const PoolConfigSchema = z.object({
   /** Maximum concurrent requests (default: 100) */
@@ -36,6 +38,8 @@ export const PoolConfigSchema = z.object({
   queueSize: z.number().int().min(1).max(1000).default(200),
   /** Queue timeout in milliseconds (default: 30000ms = 30s) */
   queueTimeoutMs: z.number().int().min(1000).max(300000).default(30000),
+  /** Per-server connect timeout in milliseconds (default: 15000ms = 15s) */
+  connectTimeoutMs: z.number().int().min(1000).max(120000).default(15000),
 });
 
 export type PoolConfig = z.infer<typeof PoolConfigSchema>;

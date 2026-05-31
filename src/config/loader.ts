@@ -282,6 +282,7 @@ export function getPoolConfig(): PoolConfig {
       maxConcurrent: parseEnvInt(process.env.POOL_MAX_CONCURRENT, 'POOL_MAX_CONCURRENT'),
       queueSize: parseEnvInt(process.env.POOL_QUEUE_SIZE, 'POOL_QUEUE_SIZE'),
       queueTimeoutMs: parseEnvInt(process.env.POOL_QUEUE_TIMEOUT_MS, 'POOL_QUEUE_TIMEOUT_MS'),
+      connectTimeoutMs: parseEnvInt(process.env.POOL_CONNECT_TIMEOUT_MS, 'POOL_CONNECT_TIMEOUT_MS'),
     });
   } catch (error) {
     // WHY: Wrap Zod errors with user-friendly messages
@@ -291,7 +292,7 @@ export function getPoolConfig(): PoolConfig {
       const field = firstError?.path.join('.') || 'unknown';
       throw new Error(
         `Invalid pool configuration: ${field} - ${firstError?.message}. ` +
-        `Check environment variables: POOL_MAX_CONCURRENT (1-1000), POOL_QUEUE_SIZE (1-1000), POOL_QUEUE_TIMEOUT_MS (1000-300000).`
+        `Check environment variables: POOL_MAX_CONCURRENT (1-1000), POOL_QUEUE_SIZE (1-1000), POOL_QUEUE_TIMEOUT_MS (1000-300000), POOL_CONNECT_TIMEOUT_MS (1000-120000).`
       );
     }
     // Re-throw non-Zod errors (e.g., parseEnvInt errors)
