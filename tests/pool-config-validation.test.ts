@@ -20,6 +20,7 @@ describe('Pool Configuration Validation (SEC-002)', () => {
     delete process.env.POOL_MAX_CONCURRENT;
     delete process.env.POOL_QUEUE_SIZE;
     delete process.env.POOL_QUEUE_TIMEOUT_MS;
+    delete process.env.POOL_CONNECT_TIMEOUT_MS;
   });
 
   afterEach(() => {
@@ -34,6 +35,7 @@ describe('Pool Configuration Validation (SEC-002)', () => {
       expect(config.maxConcurrent).toBe(100);
       expect(config.queueSize).toBe(200);
       expect(config.queueTimeoutMs).toBe(30000);
+      expect(config.connectTimeoutMs).toBe(15000);
     });
   });
 
@@ -42,12 +44,14 @@ describe('Pool Configuration Validation (SEC-002)', () => {
       process.env.POOL_MAX_CONCURRENT = '50';
       process.env.POOL_QUEUE_SIZE = '100';
       process.env.POOL_QUEUE_TIMEOUT_MS = '60000';
+      process.env.POOL_CONNECT_TIMEOUT_MS = '8000';
 
       const config = getPoolConfig();
 
       expect(config.maxConcurrent).toBe(50);
       expect(config.queueSize).toBe(100);
       expect(config.queueTimeoutMs).toBe(60000);
+      expect(config.connectTimeoutMs).toBe(8000);
     });
 
     it('should_acceptMinimumValues_when_atLowerBound', () => {

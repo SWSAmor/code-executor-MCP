@@ -10,6 +10,7 @@ import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js'
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
 import { SSEClientTransport } from '@modelcontextprotocol/sdk/client/sse.js';
 import { EventEmitter } from 'events';
+import { execFileSync } from 'child_process';
 import * as fs from 'fs/promises';
 import { getPoolConfig } from '../config/loader.js';
 import { isValidMCPToolName, normalizeError, isErrnoException } from '../utils/utils.js';
@@ -46,6 +47,8 @@ export interface MCPClientPoolConfig {
   queueSize?: number;
   /** Queue timeout in milliseconds (default: 30000ms = 30s) */
   queueTimeoutMs?: number;
+  /** Per-server connect timeout in milliseconds (default: 15000ms = 15s) */
+  connectTimeoutMs?: number;
 }
 
 /**
@@ -64,6 +67,25 @@ export class MCPClientPool implements IToolSchemaProvider {
   private toolCache: Map<string, ToolInfo> = new Map();
   private processes: Map<string, ProcessInfo> = new Map();
   private initialized = false;
+
+  // Per-server connect timeout: a single slow/unreachable downstream server must
+  // never stall pool startup (which would delay the upstream MCP handshake and
+  // trigger a supervisor restart loop). See connectStdio/connectHttp.
+  private connectTimeoutMs: number;
+
+  // STDIO transports that have spawned a child process but whose connect() has
+  // not yet resolved. Tracked here so a child can still be reaped if the whole
+  // pool is torn down (or the process exits) before connect() completes —
+  // otherwise these children leak as orphans on a mid-init shutdown/kill.
+  private pendingStdioTransports: Set<StdioClientTransport> = new Set();
+
+  // Recursion guard. A code-executor wired (directly, or indirectly via another
+  // MCP host such as its own agent gateway) as a downstream server of another
+  // code-executor forms a spawn cycle that fork-bombs the machine. Name-based
+  // self-exclusion cannot catch the indirect case (the intermediary is a
+  // different program). Instead, at startup we walk the parent-PID chain and run
+  // in LEAF MODE (connect to no downstream servers) if any ancestor is itself a
+  // code-executor process. See hasCodeExecutorAncestor().
 
   // US4: Concurrency limiting and overflow queue
   private maxConcurrent: number;
@@ -91,6 +113,9 @@ export class MCPClientPool implements IToolSchemaProvider {
     // T053: Store queue timeout for waitForQueueSlot
     this.queueTimeoutMs = config?.queueTimeoutMs ?? poolConfig.queueTimeoutMs;
 
+    // Per-server connect timeout (Priority: explicit config > env-validated default)
+    this.connectTimeoutMs = config?.connectTimeoutMs ?? poolConfig.connectTimeoutMs;
+
     // T053: Initialize connection queue
     this.connectionQueue = new ConnectionQueue({
       maxSize: config?.queueSize ?? poolConfig.queueSize,
@@ -107,10 +132,98 @@ export class MCPClientPool implements IToolSchemaProvider {
   }
 
   /**
+   * Walk this process's parent-PID chain and report whether any ancestor is
+   * itself a code-executor process. This is what breaks the cycle: a
+   * code-executor nested under another (directly, or via an intermediate MCP
+   * host) detects the ancestor and runs in leaf mode.
+   *
+   * Why walk the live process table instead of an inherited env marker: the
+   * intermediary (observed: an agent gateway's `mcp serve`) does NOT forward
+   * our environment to the children it spawns, so a marker never reaches the
+   * nested instance. Parent PIDs, by contrast, are always there to read.
+   *
+   * Why the whole chain, not just the direct parent: in the cyclic case the
+   * direct parent is the host (e.g. hermes), not a code-executor — the
+   * code-executor ancestor is one hop further up.
+   *
+   * Matching is on the ancestor's argv0 basename only (not the whole command
+   * line), so a shell wrapper like `sh -c "... /path/code-executor-mcp ..."`
+   * (whose argv0 is "sh") is not mistaken for a code-executor.
+   *
+   * Best-effort: returns false if `ps` is unavailable (e.g. Windows) or the
+   * query fails.
+   */
+  private static hasCodeExecutorAncestor(): boolean {
+    const SELF_BINARY = 'code-executor-mcp';
+    try {
+      let pid = process.ppid;
+      let hops = 0;
+      while (pid && pid > 1 && hops < 64) {
+        hops++;
+        const out = execFileSync('ps', ['-o', 'ppid=,command=', '-p', String(pid)], {
+          encoding: 'utf8',
+          timeout: 2000,
+        }).trim();
+        if (!out) {
+          break;
+        }
+        const spaceIdx = out.indexOf(' ');
+        const ppidStr = spaceIdx === -1 ? out : out.slice(0, spaceIdx);
+        const command = spaceIdx === -1 ? '' : out.slice(spaceIdx + 1);
+        // argv0 = first whitespace-delimited token; compare its basename.
+        const argv0 = command.split(/\s+/)[0] ?? '';
+        const argv0Base = argv0.split('/').pop() ?? '';
+        if (argv0Base === SELF_BINARY) {
+          return true;
+        }
+        const nextPid = Number.parseInt(ppidStr, 10);
+        if (!Number.isFinite(nextPid) || nextPid === pid) {
+          break;
+        }
+        pid = nextPid;
+      }
+    } catch {
+      // ps unavailable / query failed — guard simply does not engage here.
+    }
+    return false;
+  }
+
+  /**
+   * Whether a downstream server config points at code-executor itself (so
+   * launching it would recurse). Matches the command's basename against our
+   * binary name, or exact equality with our own executable path — independent
+   * of the config key name. HTTP servers are never self.
+   */
+  private static isSelfServer(config: MCPServerConfig): boolean {
+    if (!isStdioConfig(config)) {
+      return false;
+    }
+    const command = config.command ?? '';
+    const base = command.split('/').pop() ?? '';
+    return base === 'code-executor-mcp' || command === process.execPath;
+  }
+
+  /**
    * Initialize client pool by reading config and connecting to servers
    */
   async initialize(configPath?: string): Promise<void> {
     if (this.initialized) {
+      return;
+    }
+
+    // Recursion guard: if this code-executor is itself nested under another
+    // code-executor — directly, or indirectly via an MCP host such as an agent
+    // gateway — do NOT connect to any downstream servers, to prevent a spawn
+    // cycle that would fork-bomb the machine.
+    const allowNested = process.env.CODE_EXECUTOR_ALLOW_NESTED === '1'
+      || process.env.CODE_EXECUTOR_ALLOW_NESTED === 'true';
+    if (!allowNested && MCPClientPool.hasCodeExecutorAncestor()) {
+      console.error(
+        `🛑 Nested code-executor detected (a code-executor process is an ancestor — ` +
+        `cyclic MCP topology) — running in LEAF MODE: not connecting to any downstream ` +
+        `MCP servers, to prevent a spawn cycle. Set CODE_EXECUTOR_ALLOW_NESTED=1 to override.`
+      );
+      this.initialized = true;
       return;
     }
 
@@ -201,7 +314,23 @@ export class MCPClientPool implements IToolSchemaProvider {
       }
 
       const filteredServers = Object.entries(config.mcpServers).filter(
-        ([serverName]) => !excludeSet.has(serverName)
+        ([serverName, serverConfig]) => {
+          // Name-based exclusion (self under the conventional "code-executor"
+          // key, plus user/env exclusions).
+          if (excludeSet.has(serverName)) {
+            return false;
+          }
+          // Path-based self-exclusion: never launch a downstream server that is
+          // code-executor itself — regardless of the config key name. This
+          // catches the "wired self in under a different name" case that the
+          // name check above would miss. (Does not catch an indirect cycle via
+          // a different host program; the ancestry guard handles that.)
+          if (MCPClientPool.isSelfServer(serverConfig)) {
+            console.error(`🚫 Skipping downstream server '${serverName}': its command is code-executor itself (would recurse).`);
+            return false;
+          }
+          return true;
+        }
       );
 
       const userExclusions = [...excludeSet].filter(n => n !== 'code-executor');
@@ -210,57 +339,64 @@ export class MCPClientPool implements IToolSchemaProvider {
       }
       console.error(`🔌 Initializing MCP client pool (excluding self${userExclusions.length > 0 ? ` + ${userExclusions.length} excluded` : ''}, ${filteredServers.length} servers)`);
 
-      // Connect to each configured server with detailed error tracking
+      // Connect to each configured server. Each connection is independent and
+      // bounded by connectTimeoutMs (see connectToServer), so one slow/unreachable
+      // server can never block the others — failures degrade gracefully and the
+      // pool comes up with whatever connected. A failed server is NEVER added to
+      // `clients`/`toolCache`, so its tools are not discoverable or callable.
       const serverNames = filteredServers.map(([name]) => name);
-      const connections = filteredServers.map(
-        ([serverName, serverConfig]) =>
-          this.connectToServer(serverName, serverConfig)
+      const outcomes = await Promise.all(
+        filteredServers.map(async ([serverName, serverConfig]) => {
+          const startedAt = Date.now();
+          try {
+            await this.connectToServer(serverName, serverConfig);
+            return { serverName, ok: true as const, ms: Date.now() - startedAt };
+          } catch (error) {
+            return {
+              serverName,
+              ok: false as const,
+              ms: Date.now() - startedAt,
+              error: error instanceof Error ? error.message : String(error),
+            };
+          }
+        })
       );
 
-      const results = await Promise.allSettled(connections);
+      const failures = outcomes.filter(o => !o.ok);
+      const successes = outcomes.length - failures.length;
 
-      // Track failures
-      const failures = results.filter(r => r.status === 'rejected');
+      // Per-server startup status report: one line per configured server (so a
+      // 9-server config produces 9 lines), with the failure reason when known.
+      // This is the authoritative record of what came up and what did not.
+      if (serverNames.length === 0) {
+        console.error('ℹ️  No other MCP servers configured (code-executor running standalone)');
+      } else {
+        console.error(`📋 MCP server startup report (${successes}/${serverNames.length} connected):`);
+        for (const o of outcomes) {
+          if (o.ok) {
+            console.error(`  ✓ ${o.serverName} (${o.ms}ms)`);
+          } else {
+            console.error(`  ✗ ${o.serverName} (${o.ms}ms): ${o.error}`);
+          }
+        }
+      }
 
-      // If ALL servers failed (and there were servers to connect to), throw error
-      // Allow zero servers as valid configuration (code-executor can run standalone)
+      // If ALL servers failed (and there were servers to connect to), throw error.
+      // Allow zero servers as a valid configuration (code-executor runs standalone).
       if (serverNames.length > 0 && failures.length === serverNames.length) {
-        const errorMessages = results
-          .map((r, i) => {
-            if (r.status === 'rejected') {
-              return `  - ${serverNames[i]}: ${r.reason instanceof Error ? r.reason.message : String(r.reason)}`;
-            }
-            return '';
-          })
-          .filter(Boolean)
+        const errorMessages = failures
+          .map(o => `  - ${o.serverName}: ${o.error}`)
           .join('\n');
-
         throw new Error(
           `All MCP server connections failed. Check .mcp.json configuration:\n${errorMessages}`
         );
       }
 
-      // If zero servers configured, log info message
-      if (serverNames.length === 0) {
-        console.error('ℹ️  No other MCP servers configured (code-executor running standalone)');
-      }
-
-      // If some servers failed, warn but continue
       if (failures.length > 0) {
-        console.warn(`⚠️  ${failures.length}/${serverNames.length} MCP servers failed to connect`);
-        failures.forEach((f, i) => {
-          if (f.status === 'rejected') {
-            const serverName = serverNames[i];
-            console.error(`  ✗ ${serverName}: ${f.reason instanceof Error ? f.reason.message : String(f.reason)}`);
-          }
-        });
+        console.warn(`⚠️  ${failures.length}/${serverNames.length} MCP servers failed to connect — continuing without them`);
       }
 
-      // Report successful connections
-      const successes = results.filter(r => r.status === 'fulfilled').length;
-      console.error(`✓ Connected to ${successes}/${serverNames.length} MCP servers`);
-
-      // Cache tool listings
+      // Cache tool listings (only from successfully connected servers)
       await this.cacheToolListings();
 
       this.initialized = true;
@@ -279,6 +415,43 @@ export class MCPClientPool implements IToolSchemaProvider {
       await this.connectHttp(serverName, config);
     } else {
       throw new Error(`Unknown transport type for server: ${serverName}`);
+    }
+  }
+
+  /**
+   * Race a client.connect() against connectTimeoutMs.
+   *
+   * On timeout (or connect rejection) the error is propagated to the caller,
+   * which owns transport/child teardown. The still-pending connect promise is
+   * detached with a no-op catch so a late rejection cannot surface as an
+   * unhandled rejection after we have moved on.
+   */
+  private async connectWithTimeout(
+    client: Client,
+    transport: Parameters<Client['connect']>[0],
+    serverName: string
+  ): Promise<void> {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const connectPromise = client.connect(transport);
+    const timeoutPromise = new Promise<never>((_, reject) => {
+      timer = setTimeout(
+        () => reject(new Error(`connect timed out after ${this.connectTimeoutMs}ms`)),
+        this.connectTimeoutMs
+      );
+    });
+
+    try {
+      await Promise.race([connectPromise, timeoutPromise]);
+    } catch (error) {
+      // Detach the losing connect promise so a late rejection is swallowed.
+      void connectPromise.catch(() => { /* superseded by timeout/failure */ });
+      throw error instanceof Error
+        ? error
+        : new Error(`Failed to connect to ${serverName}: ${String(error)}`);
+    } finally {
+      if (timer) {
+        clearTimeout(timer);
+      }
     }
   }
 
@@ -307,10 +480,35 @@ export class MCPClientPool implements IToolSchemaProvider {
       },
     });
 
-    // Connect to server
-    await client.connect(transport);
+    // Track the transport BEFORE connecting: connect() spawns the child process,
+    // so if connect hangs (or the pool is torn down mid-init) we must still be
+    // able to reap that child via this set. Removed once connect settles.
+    this.pendingStdioTransports.add(transport);
 
-    // Track process for cleanup
+    try {
+      await this.connectWithTimeout(client, transport, serverName);
+    } catch (error) {
+      // Capture the spawned child PID before close() clears it, then tear the
+      // child down explicitly (SIGKILL) so a slow/failed server leaves no orphan.
+      // Explicit kill-by-PID is used in addition to transport.close() because the
+      // AbortController-based kill is not reliable across runtimes (e.g. Bun).
+      const orphanPid = transport.pid;
+      this.pendingStdioTransports.delete(transport);
+      void transport.close().catch(() => { /* best effort */ });
+      void client.close().catch(() => { /* best effort */ });
+      if (orphanPid != null) {
+        try {
+          process.kill(orphanPid, 'SIGKILL');
+        } catch {
+          // ESRCH (already gone) or not-permitted — nothing more to do.
+        }
+      }
+      throw error;
+    }
+
+    this.pendingStdioTransports.delete(transport);
+
+    // Track process for graceful cleanup on shutdown
     if (transport.pid) {
       this.processes.set(serverName, {
         pid: transport.pid,
@@ -351,7 +549,7 @@ export class MCPClientPool implements IToolSchemaProvider {
           },
         }
       );
-      await client.connect(transport);
+      await this.connectWithTimeout(client, transport, serverName);
       connected = true;
       console.error(`✓ Connected to ${serverName} via StreamableHTTP`);
     } catch {
@@ -368,7 +566,7 @@ export class MCPClientPool implements IToolSchemaProvider {
           },
         }
       );
-      await client.connect(transport);
+      await this.connectWithTimeout(client, transport, serverName);
       console.error(`✓ Connected to ${serverName} via SSE (fallback)`);
     }
 
@@ -781,6 +979,28 @@ export class MCPClientPool implements IToolSchemaProvider {
 
     await Promise.all(processCleanup);
 
+    // Close any transports whose connect() is still in flight (mid-init shutdown).
+    // These are not yet in `processes`, so without this their children would leak.
+    const pendingCleanup = Array.from(this.pendingStdioTransports).map(
+      async (transport) => {
+        const pid = transport.pid;
+        try {
+          await transport.close();
+        } catch {
+          // best effort
+        }
+        if (pid != null) {
+          try {
+            process.kill(pid, 'SIGKILL');
+          } catch {
+            // already gone / not permitted
+          }
+        }
+      }
+    );
+    await Promise.all(pendingCleanup);
+    this.pendingStdioTransports.clear();
+
     // Clear all state
     this.clients.clear();
     this.toolCache.clear();
@@ -791,6 +1011,34 @@ export class MCPClientPool implements IToolSchemaProvider {
     // During shutdown, there may be queued requests still waiting for slot notifications.
     // Removing listeners ensures clean shutdown without dangling event handlers.
     this.queueSlotEmitter.removeAllListeners();
+  }
+
+  /**
+   * Synchronously SIGKILL every child process this pool has spawned.
+   *
+   * Last-resort backstop for `process.on('exit')`, where only synchronous work
+   * runs: async disconnect() cannot complete there. Covers both fully-connected
+   * STDIO servers (`processes`) and connects still in flight (`pendingStdioTransports`),
+   * so a hard exit never leaves orphaned downstream MCP processes behind.
+   */
+  killChildrenSync(): void {
+    const pids = new Set<number>();
+    for (const { pid } of this.processes.values()) {
+      pids.add(pid);
+    }
+    for (const transport of this.pendingStdioTransports) {
+      const pid = transport.pid;
+      if (pid != null) {
+        pids.add(pid);
+      }
+    }
+    for (const pid of pids) {
+      try {
+        process.kill(pid, 'SIGKILL');
+      } catch {
+        // already gone / not permitted — nothing to do in a sync exit handler
+      }
+    }
   }
 
   /**

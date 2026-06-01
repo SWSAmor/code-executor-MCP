@@ -65,6 +65,12 @@ class CodeExecutorServer {
   private denoAvailable: boolean = false;
   private healthCheckServer: HealthCheckServer | null = null;
   private shutdownInProgress = false; // P1: Prevent concurrent shutdown attempts
+  // Resolves when the downstream MCP client pool has finished initializing.
+  // The pool is initialized in the BACKGROUND (see start()) so the upstream MCP
+  // handshake is never blocked by slow/unreachable downstream servers. Tool
+  // handlers await this before executing so downstream tools are ready (or have
+  // been determined unavailable) by the time code runs.
+  private poolReady: Promise<void> = Promise.resolve();
 
   constructor() {
     // Initialize MCP server
@@ -280,6 +286,11 @@ Example:
               isError: true,
             };
           }
+
+          // Ensure the downstream MCP pool has finished initializing (it is set
+          // up in the background at startup) so callMCPTool/discovery see the
+          // connected servers. Bounded by per-server connect timeouts.
+          await this.poolReady;
 
           // Execute code with connection pooling
           const result = await this.connectionPool.execute(async () => {
@@ -537,6 +548,10 @@ Example:
             };
           }
 
+          // Ensure the downstream MCP pool has finished initializing (background
+          // startup) before executing. Bounded by per-server connect timeouts.
+          await this.poolReady;
+
           // Execute code with connection pooling
           // Use Pyodide (secure) when PYTHON_SANDBOX_READY, otherwise native (insecure)
           // Pyodide loaded lazily so its 13MB WASM stays out of compiled binaries that don't enable it.
@@ -695,12 +710,32 @@ Returns:
       }
     }
 
-    // Initialize MCP client pool
-    console.error('Initializing MCP client pool...');
-    await this.mcpClientPool.initialize();
+    // Start stdio transport FIRST so the upstream MCP handshake (initialize +
+    // tools/list) is answered immediately. The downstream client pool is then
+    // initialized in the BACKGROUND. This decouples our own readiness from the
+    // health of downstream servers: a slow/unreachable server can no longer
+    // delay startup past the host's timeout and trigger a respawn loop.
+    const transport = new StdioServerTransport();
+    await this.server.connect(transport);
 
-    const tools = this.mcpClientPool.listAllTools();
-    console.error(`Connected to ${tools.length} MCP tools across multiple servers`);
+    console.error('Code Executor MCP Server started successfully (downstream MCP pool initializing in background)');
+
+    // Initialize MCP client pool in the background. Tool handlers await
+    // `poolReady` before executing (see registerTools). Failures are logged but
+    // never crash the server — code-executor keeps serving whatever connected.
+    console.error('Initializing MCP client pool...');
+    this.poolReady = this.mcpClientPool
+      .initialize()
+      .then(() => {
+        const tools = this.mcpClientPool.listAllTools();
+        console.error(`Connected to ${tools.length} MCP tools across multiple servers`);
+      })
+      .catch((error) => {
+        const message = error instanceof Error ? error.message : String(error);
+        console.error(
+          `MCP client pool initialization failed — continuing without downstream tools: ${message}`
+        );
+      });
 
     // Initialize health check server (optional, enabled via env var)
     const enableHealthCheck = process.env.ENABLE_HEALTH_CHECK !== 'false';
@@ -720,12 +755,14 @@ Returns:
         this.healthCheckServer = null;
       }
     }
+  }
 
-    // Start stdio transport
-    const transport = new StdioServerTransport();
-    await this.server.connect(transport);
-
-    console.error('Code Executor MCP Server started successfully');
+  /**
+   * Synchronously kill all spawned downstream child processes.
+   * Backstop for the process 'exit' handler (see bottom of file).
+   */
+  killChildrenSync(): void {
+    this.mcpClientPool.killChildrenSync();
   }
 
   /**
@@ -829,6 +866,18 @@ const handleShutdownSignal = async (signal: string) => {
 
 process.on('SIGINT', () => void handleShutdownSignal('SIGINT'));
 process.on('SIGTERM', () => void handleShutdownSignal('SIGTERM'));
+
+// Synchronous last-resort cleanup. If the process exits without the async
+// graceful path completing (e.g. host sends SIGKILL after a timeout, or an
+// unexpected exit), this guarantees spawned downstream MCP children are killed
+// rather than left as orphans. Must be synchronous — no async work runs here.
+process.on('exit', () => {
+  try {
+    server.killChildrenSync();
+  } catch {
+    // Nothing actionable during exit.
+  }
+});
 
 // Argument parsing: Handle CLI commands
 const args = process.argv.slice(2);
