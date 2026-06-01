@@ -7,6 +7,64 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### 🛡️ MCP pool startup resilience & spawn-cycle protection
+
+Hardens code-executor startup against two failure modes observed when running
+behind an MCP host (e.g. the Hermes agent gateway): a respawn loop driven by
+slow/unreachable downstream servers, and a fork bomb caused by a cyclic MCP
+topology. See `docs/mcp-pool-startup-resilience.md` for the full diagnosis.
+
+#### Fixed
+
+- **Startup respawn loop** — the upstream MCP handshake was answered only AFTER
+  connecting to every downstream server, so one slow/unreachable server delayed
+  startup past the host's timeout, causing the host to kill and respawn the
+  process repeatedly (each spawn leaking child MCP processes).
+  - **Fix:** connect the upstream stdio transport FIRST, then initialize the
+    downstream client pool in the background. Tool handlers await pool readiness
+    before executing. Total downstream failure no longer crashes the server.
+  - **Files:** `src/index.ts`, `src/mcp/client-pool.ts`
+
+- **Spawn cycle / fork bomb** — when the host lists code-executor as a server
+  AND code-executor's config lists that same host as a downstream server, the
+  two spawn each other indefinitely. Name-based self-exclusion cannot catch this
+  (the intermediary is a different program).
+  - **Fix:** at startup, walk the parent-PID chain (`ps`); if any ancestor is
+    itself a code-executor, run in LEAF MODE (connect to no downstream servers).
+    Reliable even when the host strips the environment of its children.
+    Overridable via `CODE_EXECUTOR_ALLOW_NESTED=1`.
+  - **Files:** `src/mcp/client-pool.ts`
+
+- **Orphaned child MCP processes** — children spawned during a connect that was
+  killed mid-init were not tracked, so they leaked as orphans.
+  - **Fix:** track in-flight transports and reap them on shutdown; add a
+    synchronous `process.on('exit')` backstop that SIGKILLs all spawned children.
+  - **Files:** `src/mcp/client-pool.ts`, `src/index.ts`
+
+#### Added
+
+- **Per-server connect timeout** — each downstream connect is bounded by
+  `POOL_CONNECT_TIMEOUT_MS` (default 15000, range 1000–120000); a hung server is
+  marked failed instead of blocking the whole pool. On timeout its spawned child
+  is killed explicitly by PID (AbortController-based kill is unreliable on Bun).
+  - **Files:** `src/config/types.ts`, `src/config/loader.ts`, `src/mcp/client-pool.ts`
+
+- **Path-based self-exclusion** — a downstream server whose command IS
+  code-executor itself (binary basename or exact `process.execPath`) is skipped
+  regardless of its config key name, catching "wired self in under a different
+  name" that the name-based exclusion misses.
+  - **Files:** `src/mcp/client-pool.ts`
+
+- **Per-server startup status report** — pool init logs one line per configured
+  server (✓/✗ with duration and failure reason) plus an N/M summary.
+  - **Files:** `src/mcp/client-pool.ts`
+
+#### Tests
+
+- `tests/recursion-guard.test.ts` — path-based self-exclusion and ancestry/leaf-mode
+  guard (including the `CODE_EXECUTOR_ALLOW_NESTED` override).
+- `tests/pool-config-validation.test.ts` — `connectTimeoutMs` default and parsing.
+
 ## [1.0.5] - 2025-11-23
 
 ### 🚨 CRITICAL BUGFIX #4
