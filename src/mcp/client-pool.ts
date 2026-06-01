@@ -189,6 +189,21 @@ export class MCPClientPool implements IToolSchemaProvider {
   }
 
   /**
+   * Whether a downstream server config points at code-executor itself (so
+   * launching it would recurse). Matches the command's basename against our
+   * binary name, or exact equality with our own executable path — independent
+   * of the config key name. HTTP servers are never self.
+   */
+  private static isSelfServer(config: MCPServerConfig): boolean {
+    if (!isStdioConfig(config)) {
+      return false;
+    }
+    const command = config.command ?? '';
+    const base = command.split('/').pop() ?? '';
+    return base === 'code-executor-mcp' || command === process.execPath;
+  }
+
+  /**
    * Initialize client pool by reading config and connecting to servers
    */
   async initialize(configPath?: string): Promise<void> {
@@ -299,7 +314,23 @@ export class MCPClientPool implements IToolSchemaProvider {
       }
 
       const filteredServers = Object.entries(config.mcpServers).filter(
-        ([serverName]) => !excludeSet.has(serverName)
+        ([serverName, serverConfig]) => {
+          // Name-based exclusion (self under the conventional "code-executor"
+          // key, plus user/env exclusions).
+          if (excludeSet.has(serverName)) {
+            return false;
+          }
+          // Path-based self-exclusion: never launch a downstream server that is
+          // code-executor itself — regardless of the config key name. This
+          // catches the "wired self in under a different name" case that the
+          // name check above would miss. (Does not catch an indirect cycle via
+          // a different host program; the ancestry guard handles that.)
+          if (MCPClientPool.isSelfServer(serverConfig)) {
+            console.error(`🚫 Skipping downstream server '${serverName}': its command is code-executor itself (would recurse).`);
+            return false;
+          }
+          return true;
+        }
       );
 
       const userExclusions = [...excludeSet].filter(n => n !== 'code-executor');
