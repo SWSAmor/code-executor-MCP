@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### 🧹 stdio stdout hygiene (JSON-RPC stream no longer corrupted by logs)
+
+#### Fixed
+
+- **`Unexpected token '✓' ... is not valid JSON` on a strict host (e.g. Claude
+  Desktop)** — on stdio, stdout is the JSON-RPC channel (the SDK writes frames
+  there via `process.stdout.write`). Stray `console.log()` calls write to the
+  same stream and corrupt it. The per-execution proxy server logged
+  `✓ HTTP server drained successfully` via `console.log` on **every**
+  `executeTypescript`/`executePython` call, so a strict host rejected the
+  stream on every operation (~18 such `console.log` sites exist across the
+  server path). A previously-wired wrapper script had been masking this.
+  - **Fix:** in stdio-server mode, reroute `console.log`/`info`/`debug` to
+    stderr before any server code runs, so only JSON-RPC reaches stdout.
+    `console.error`/`console.warn` (already stderr) and the SDK's stdout writes
+    are untouched. CLI subcommands (setup, sync-wrappers) keep stdout.
+  - **Files:** `src/utils/stdio-guard.ts` (new), `src/index.ts`
+
 ### 🛡️ MCP pool startup resilience & spawn-cycle protection
 
 Hardens code-executor startup against two failure modes observed when running
