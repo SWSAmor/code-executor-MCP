@@ -16,6 +16,7 @@ import { z } from 'zod';
 import { initConfig, isPythonEnabled, isRateLimitEnabled, getRateLimitConfig, shouldSkipDangerousPatternCheck } from './config/loader.js';
 import { ExecuteTypescriptInputSchema, ExecutePythonInputSchema, ExecutionResultSchema } from './config/schemas.js';
 import { MCPClientPool } from './mcp/client-pool.js';
+import { watchClientDisconnect } from './mcp/stdin-watcher.js';
 import { SecurityValidator } from './validation/security-validator.js';
 import { ConnectionPool } from './mcp/connection-pool.js';
 import { RateLimiter } from './security/rate-limiter.js';
@@ -717,6 +718,19 @@ Returns:
     // delay startup past the host's timeout and trigger a respawn loop.
     const transport = new StdioServerTransport();
     await this.server.connect(transport);
+
+    // Shut down when the MCP host disconnects. The host's exit closes our stdin
+    // pipe (EOF); on macOS that is the only signal we get that the parent is
+    // gone (no death signal is delivered to children), and the SDK transport
+    // does not act on it. Without this the server and every downstream MCP
+    // child it spawned orphan after the host exits. See stdin-watcher.ts.
+    watchClientDisconnect(process.stdin, (reason) => {
+      console.error(`stdin ${reason} — MCP client disconnected, initiating shutdown...`);
+      void this.shutdown().catch((error) => {
+        console.error('Error during disconnect-triggered shutdown:', error);
+        process.exit(1);
+      });
+    });
 
     console.error('Code Executor MCP Server started successfully (downstream MCP pool initializing in background)');
 
