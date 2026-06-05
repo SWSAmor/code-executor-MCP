@@ -17,6 +17,7 @@ import { initConfig, isPythonEnabled, isRateLimitEnabled, getRateLimitConfig, sh
 import { ExecuteTypescriptInputSchema, ExecutePythonInputSchema, ExecutionResultSchema } from './config/schemas.js';
 import { MCPClientPool } from './mcp/client-pool.js';
 import { watchClientDisconnect } from './mcp/stdin-watcher.js';
+import { redirectConsoleLogToStderr } from './utils/stdio-guard.js';
 import { SecurityValidator } from './validation/security-validator.js';
 import { ConnectionPool } from './mcp/connection-pool.js';
 import { RateLimiter } from './security/rate-limiter.js';
@@ -924,7 +925,14 @@ if (command === 'setup') {
       process.exit(1);
     });
 } else {
-  // Normal server startup flow
+  // Normal server startup flow (stdio MCP server).
+  //
+  // Reroute console.log/info/debug to stderr BEFORE any server code runs. On
+  // stdio, stdout is the JSON-RPC channel; a stray console.log corrupts it and
+  // strict hosts (e.g. Claude Desktop) reject the stream. See stdio-guard.ts.
+  // Scoped to server mode only — the CLI subcommands above keep stdout.
+  redirectConsoleLogToStderr();
+
   (async () => {
     try {
       const location = await detectMCPConfigLocation();
