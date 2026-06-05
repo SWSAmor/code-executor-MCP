@@ -41,6 +41,19 @@ topology. See `docs/mcp-pool-startup-resilience.md` for the full diagnosis.
     synchronous `process.on('exit')` backstop that SIGKILLs all spawned children.
   - **Files:** `src/mcp/client-pool.ts`, `src/index.ts`
 
+- **Orphaned process tree on host disconnect** — when the MCP host (e.g. Claude
+  Code) exited, the code-executor it spawned kept running, taking its whole
+  downstream pool (Hermes + nested code-executor) with it. On macOS a child
+  receives no signal when its parent dies, and the SDK's `StdioServerTransport`
+  listens only for `'data'`/`'error'` on stdin — it never translates the EOF
+  from the closed pipe into a transport close. With nothing acting on the EOF,
+  the process never reached `exit`, so even the `process.on('exit')` reap
+  backstop never fired. Multiple host sessions accumulated whole orphan trees.
+  - **Fix:** watch `process.stdin` for `'end'`/`'close'` after the transport
+    connects and trigger the existing graceful `shutdown()` (which disconnects
+    the downstream pool, SIGTERM/SIGKILLs its children, then exits).
+  - **Files:** `src/mcp/stdin-watcher.ts` (new), `src/index.ts`
+
 #### Added
 
 - **Per-server connect timeout** — each downstream connect is bounded by
