@@ -18,9 +18,25 @@ import { z } from 'zod';
 let config: Config | null = null;
 
 /**
- * Maximum response length in characters (compile-time constant)
+ * Default maximum output length in characters.
+ *
+ * Applied to executor stdout via `truncateOutput`. Originally 25_000, sized for
+ * the 100-200k token context windows of the time; raised to 65_536 (64 KiB) now
+ * that 1M-token context windows are common. Overridable at runtime via the
+ * CODE_EXECUTOR_MAX_OUTPUT_CHARACTERS environment variable (see
+ * {@link getCharacterLimit}).
  */
-export const CHARACTER_LIMIT = 25_000;
+export const DEFAULT_CHARACTER_LIMIT = 65_536;
+
+/**
+ * Bounds for the runtime-configurable output character limit.
+ *
+ * - MIN keeps at least a small, useful slice of output even if misconfigured low.
+ * - MAX stays below the ~1 MB stdout buffer of the executor child process, so the
+ *   limit can never be raised past what the transport can actually deliver.
+ */
+const MIN_CHARACTER_LIMIT = 1_000;
+const MAX_CHARACTER_LIMIT = 1_000_000;
 
 /**
  * Safely parse environment variable as integer with NaN detection
@@ -111,6 +127,41 @@ export function getMaxTimeoutMs(): number {
  */
 export function getMaxCodeSize(): number {
   return getConfig().security?.maxCodeSize ?? 100000;
+}
+
+/**
+ * Get the maximum output length in characters.
+ *
+ * Reads the CODE_EXECUTOR_MAX_OUTPUT_CHARACTERS environment variable when set,
+ * otherwise falls back to {@link DEFAULT_CHARACTER_LIMIT}. The value is bounds-
+ * checked so a misconfiguration fails with a clear, actionable message instead
+ * of silently producing unusable (too-small) or undeliverable (too-large) output.
+ *
+ * **WHY env-only (no config-file lookup):** mirrors `getPoolConfig` — this is an
+ * operational tuning knob read on every truncation, with no dependency on
+ * `initConfig()` having run, so it stays usable in any execution context.
+ *
+ * @returns Effective character limit for output truncation
+ * @throws {Error} If the env var is non-numeric or outside the allowed range
+ */
+export function getCharacterLimit(): number {
+  const override = parseEnvInt(
+    process.env.CODE_EXECUTOR_MAX_OUTPUT_CHARACTERS,
+    'CODE_EXECUTOR_MAX_OUTPUT_CHARACTERS'
+  );
+
+  if (override === undefined) {
+    return DEFAULT_CHARACTER_LIMIT;
+  }
+
+  if (override < MIN_CHARACTER_LIMIT || override > MAX_CHARACTER_LIMIT) {
+    throw new Error(
+      `Invalid CODE_EXECUTOR_MAX_OUTPUT_CHARACTERS: ${override}. ` +
+      `Expected an integer between ${MIN_CHARACTER_LIMIT} and ${MAX_CHARACTER_LIMIT}.`
+    );
+  }
+
+  return override;
 }
 
 /**

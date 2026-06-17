@@ -3,19 +3,20 @@
  */
 
 import * as crypto from 'crypto';
-import { CHARACTER_LIMIT } from '../config/loader.js';
+import { getCharacterLimit } from '../config/loader.js';
 import type { ErrorResponse, ErrorType, ExecutionResult } from '../types.js';
 
 /**
  * Truncate text to character limit with clear indicator
  */
 export function truncateOutput(text: string): string {
-  if (text.length <= CHARACTER_LIMIT) {
+  const limit = getCharacterLimit();
+  if (text.length <= limit) {
     return text;
   }
 
-  const truncated = text.slice(0, CHARACTER_LIMIT);
-  const remaining = text.length - CHARACTER_LIMIT;
+  const truncated = text.slice(0, limit);
+  const remaining = text.length - limit;
 
   return `${truncated}\n\n[Output truncated: ${remaining} more characters. Consider filtering or limiting output in your code.]`;
 }

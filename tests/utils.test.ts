@@ -2,7 +2,7 @@
  * Unit tests for utility functions
  */
 
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, afterEach } from 'vitest';
 import {
   truncateOutput,
   hashCode,
@@ -14,10 +14,22 @@ import {
   sanitizeOutput,
   normalizeError,
   formatExecutionResultForCli,
-} from '../src/utils.js';
+} from '../src/utils/utils.js';
+import { DEFAULT_CHARACTER_LIMIT } from '../src/config/loader.js';
 import { ErrorType } from '../src/types.js';
 
 describe('truncateOutput', () => {
+  const ORIGINAL_LIMIT_ENV = process.env.CODE_EXECUTOR_MAX_OUTPUT_CHARACTERS;
+
+  afterEach(() => {
+    // Restore the environment so per-test overrides never leak across tests.
+    if (ORIGINAL_LIMIT_ENV === undefined) {
+      delete process.env.CODE_EXECUTOR_MAX_OUTPUT_CHARACTERS;
+    } else {
+      process.env.CODE_EXECUTOR_MAX_OUTPUT_CHARACTERS = ORIGINAL_LIMIT_ENV;
+    }
+  });
+
   it('should_not_truncate_when_below_limit', () => {
     const text = 'Short output';
     const result = truncateOutput(text);
@@ -25,20 +37,51 @@ describe('truncateOutput', () => {
     expect(result).toBe(text);
   });
 
-  it('should_truncate_when_above_limit', () => {
-    const text = 'x'.repeat(50000); // 50k characters (limit is 25k)
+  it('should_not_truncate_at_the_old_25k_threshold', () => {
+    // Default limit raised to 64 KiB (65_536); 50k chars must now pass through intact.
+    const text = 'x'.repeat(50_000);
+
+    expect(truncateOutput(text)).toBe(text);
+  });
+
+  it('should_truncate_when_above_default_limit', () => {
+    const overBy = 4_464;
+    const text = 'x'.repeat(DEFAULT_CHARACTER_LIMIT + overBy);
     const result = truncateOutput(text);
 
     expect(result).toContain('[Output truncated:');
-    expect(result).toContain('25000 more characters');
+    expect(result).toContain(`${overBy} more characters`);
     expect(result.length).toBeLessThan(text.length);
   });
 
   it('should_include_truncation_message', () => {
-    const text = 'x'.repeat(50000);
+    const text = 'x'.repeat(DEFAULT_CHARACTER_LIMIT + 1);
     const result = truncateOutput(text);
 
     expect(result).toMatch(/\[Output truncated: \d+ more characters\. Consider filtering/);
+  });
+
+  it('should_respect_CODE_EXECUTOR_MAX_OUTPUT_CHARACTERS_override', () => {
+    process.env.CODE_EXECUTOR_MAX_OUTPUT_CHARACTERS = '1000';
+    const text = 'x'.repeat(1_500);
+    const result = truncateOutput(text);
+
+    expect(result.startsWith('x'.repeat(1_000))).toBe(true);
+    expect(result).toContain('[Output truncated: 500 more characters');
+  });
+
+  it('should_throw_on_non_numeric_override', () => {
+    process.env.CODE_EXECUTOR_MAX_OUTPUT_CHARACTERS = 'not-a-number';
+
+    expect(() => truncateOutput('x'.repeat(10))).toThrow(
+      /CODE_EXECUTOR_MAX_OUTPUT_CHARACTERS/
+    );
+  });
+
+  it('should_throw_on_out_of_range_override', () => {
+    process.env.CODE_EXECUTOR_MAX_OUTPUT_CHARACTERS = '999999999';
+
+    expect(() => truncateOutput('x')).toThrow(/between 1000 and 1000000/);
   });
 });
 
