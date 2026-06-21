@@ -13,10 +13,11 @@ import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import type { RequestHandlerExtra } from '@modelcontextprotocol/sdk/shared/protocol.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { z } from 'zod';
-import { initConfig, isPythonEnabled, isRateLimitEnabled, getRateLimitConfig, shouldSkipDangerousPatternCheck } from './config/loader.js';
+import { initConfig, isPythonEnabled, isRateLimitEnabled, getRateLimitConfig, shouldSkipDangerousPatternCheck, getChildShutdownTimeoutMs, getParentPollIntervalMs } from './config/loader.js';
 import { ExecuteTypescriptInputSchema, ExecutePythonInputSchema, ExecutionResultSchema } from './config/schemas.js';
 import { MCPClientPool } from './mcp/client-pool.js';
 import { watchClientDisconnect } from './mcp/stdin-watcher.js';
+import { watchParentExit } from './mcp/parent-watcher.js';
 import { redirectConsoleLogToStderr } from './utils/stdio-guard.js';
 import { SecurityValidator } from './validation/security-validator.js';
 import { ConnectionPool } from './mcp/connection-pool.js';
@@ -67,6 +68,7 @@ class CodeExecutorServer {
   private denoAvailable: boolean = false;
   private healthCheckServer: HealthCheckServer | null = null;
   private shutdownInProgress = false; // P1: Prevent concurrent shutdown attempts
+  private stopParentWatch: (() => void) | null = null; // halts the parent-liveness poll
   // Resolves when the downstream MCP client pool has finished initializing.
   // The pool is initialized in the BACKGROUND (see start()) so the upstream MCP
   // handshake is never blocked by slow/unreachable downstream servers. Tool
@@ -733,6 +735,25 @@ Returns:
       });
     });
 
+    // Belt-and-suspenders to the stdin watcher above: actively poll parent
+    // liveness. stdin EOF can fail to arrive (host SIGKILLed, or a wrapper/an
+    // inherited fd holds our stdin pipe's write end open), in which case this
+    // poll is the only signal that the host is gone. On POSIX, parent death
+    // reparents us to PID 1; that is what we watch for. See parent-watcher.ts.
+    this.stopParentWatch = watchParentExit({
+      getPpid: () => process.ppid,
+      initialPpid: process.ppid,
+      intervalMs: getParentPollIntervalMs(),
+      isPosix: process.platform !== 'win32',
+      onParentExit: (reason) => {
+        console.error(`Parent process gone (${reason}) — initiating shutdown...`);
+        void this.shutdown().catch((error) => {
+          console.error('Error during parent-exit-triggered shutdown:', error);
+          process.exit(1);
+        });
+      },
+    });
+
     console.error('Code Executor MCP Server started successfully (downstream MCP pool initializing in background)');
 
     // Initialize MCP client pool in the background. Tool handlers await
@@ -795,15 +816,32 @@ Returns:
    * 3. Clean up rate limiter
    * 4. Disconnect MCP clients (with 2s SIGTERM grace period)
    *
-   * @param timeoutMs - Maximum time for entire shutdown (default: 35s = 30s drain + 5s cleanup)
+   * @param timeoutMs - Maximum time for the entire shutdown. When omitted it is
+   *   derived from config as drain + per-child grace + buffer, so the graceful
+   *   child-kill window (CODE_EXECUTOR_CHILD_SHUTDOWN_TIMEOUT_MS) is never
+   *   pre-empted by this overall cap.
    */
-  async shutdown(timeoutMs: number = 35000): Promise<void> {
+  async shutdown(timeoutMs?: number): Promise<void> {
     // P1: Prevent concurrent shutdown attempts (manual + signal handler races)
     if (this.shutdownInProgress) {
       console.error('Shutdown already in progress - ignoring duplicate call');
       return;
     }
     this.shutdownInProgress = true;
+
+    // Stop the parent-liveness poll — shutdown is underway (hygiene; the guard
+    // above already makes a second trigger a no-op).
+    if (this.stopParentWatch) {
+      this.stopParentWatch();
+      this.stopParentWatch = null;
+    }
+
+    // Overall cap must outlast Phase-1 drain plus the Phase-4 per-child graceful
+    // kill window, otherwise the timeout race below would force process.exit(0)
+    // (and a synchronous SIGKILL via the 'exit' handler) before a legitimately
+    // graceful child shutdown could complete. +5s cleanup buffer.
+    const drainTimeoutMs = 30_000;
+    const effectiveTimeoutMs = timeoutMs ?? drainTimeoutMs + getChildShutdownTimeoutMs() + 5_000;
 
     const shutdownStart = Date.now();
 
@@ -812,7 +850,7 @@ Returns:
       // Phase 1: Drain connection pool (wait for active executions)
       console.error('Phase 1: Draining connection pool...');
       try {
-        await this.connectionPool.drain(30000); // 30s timeout for executions
+        await this.connectionPool.drain(drainTimeoutMs); // wait for active executions
       } catch (error) {
         console.error('Error draining connection pool:', error);
       }
@@ -846,10 +884,10 @@ Returns:
       setTimeout(() => {
         const elapsed = Date.now() - shutdownStart;
         console.error(
-          `⚠️ Shutdown timeout after ${timeoutMs}ms (elapsed: ${elapsed}ms) - forcing exit`
+          `⚠️ Shutdown timeout after ${effectiveTimeoutMs}ms (elapsed: ${elapsed}ms) - forcing exit`
         );
         resolve();
-      }, timeoutMs);
+      }, effectiveTimeoutMs);
     });
 
     await Promise.race([shutdownPromise, timeoutPromise]);
@@ -881,6 +919,9 @@ const handleShutdownSignal = async (signal: string) => {
 
 process.on('SIGINT', () => void handleShutdownSignal('SIGINT'));
 process.on('SIGTERM', () => void handleShutdownSignal('SIGTERM'));
+// SIGHUP: controlling terminal / session leader went away (a common parent-death
+// signal). Treat it as a graceful shutdown rather than the default (terminate).
+process.on('SIGHUP', () => void handleShutdownSignal('SIGHUP'));
 
 // Synchronous last-resort cleanup. If the process exits without the async
 // graceful path completing (e.g. host sends SIGKILL after a timeout, or an
