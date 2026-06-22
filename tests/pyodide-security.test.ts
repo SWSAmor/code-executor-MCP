@@ -9,7 +9,7 @@
 
 import { describe, it, expect, beforeAll, afterAll, vi } from 'vitest';
 import { executePythonInSandbox } from '../src/executors/pyodide-executor.js';
-import { MCPClientPool } from '../src/mcp-client-pool.js';
+import { MCPClientPool } from '../src/mcp/client-pool.js';
 
 describe('Pyodide Executor Security', () => {
   let mcpClientPool: MCPClientPool;

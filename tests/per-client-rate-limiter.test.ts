@@ -8,7 +8,7 @@
  */
 
 import { describe, test, expect, beforeEach, afterEach, vi } from 'vitest';
-import { PerClientRateLimiter } from '../src/per-client-rate-limiter';
+import { PerClientRateLimiter } from '../src/security/per-client-rate-limiter';
 
 describe('Per-Client Rate Limiter (US2: FR-2)', () => {
   beforeEach(() => {

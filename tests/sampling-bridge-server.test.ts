@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
-import { SamplingBridgeServer } from '../src/sampling-bridge-server';
+import { SamplingBridgeServer } from '../src/core/server/sampling-bridge-server';
 import { createServer } from 'http';
 import type { LLMProvider, LLMMessage, LLMResponse } from '../src/sampling/providers/types.js';
 

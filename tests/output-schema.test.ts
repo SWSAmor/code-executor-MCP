@@ -6,7 +6,7 @@
  */
 
 import { describe, it, expect } from 'vitest';
-import { ExecutionResultSchema, ExecutePythonInputSchema, ExecuteTypescriptInputSchema } from '../src/schemas.js';
+import { ExecutionResultSchema, ExecutePythonInputSchema, ExecuteTypescriptInputSchema } from '../src/config/schemas.js';
 
 describe('OutputSchema Structure', () => {
   it('should have ExecutionResultSchema defined with correct fields', () => {

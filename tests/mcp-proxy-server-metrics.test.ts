@@ -14,8 +14,8 @@
 
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { MCPProxyServer } from '../src/core/server/mcp-proxy-server.js';
-import type { MCPClientPool } from '../src/mcp-client-pool.js';
-import { MetricsExporter } from '../src/metrics-exporter.js';
+import type { MCPClientPool } from '../src/mcp/client-pool.js';
+import { MetricsExporter } from '../src/observability/metrics-exporter.js';
 import * as http from 'http';
 
 describe('MCPProxyServer - /metrics Endpoint Authentication', () => {

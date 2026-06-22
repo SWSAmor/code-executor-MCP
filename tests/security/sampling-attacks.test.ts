@@ -1,6 +1,6 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { executeTypescript } from '../../src/index';
-import { MCPClientPool } from '../../src/mcp-client-pool';
+import { MCPClientPool } from '../../src/mcp/client-pool';
 import nock from 'nock';
 
 let mcpClientPool: MCPClientPool;

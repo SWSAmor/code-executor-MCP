@@ -8,11 +8,11 @@
  */
 
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
-import { DiscoveryRequestHandler } from '../../src/handlers/discovery-request-handler.js';
-import type { MCPClientPool } from '../../src/mcp-client-pool.js';
-import type { SchemaCache } from '../../src/schema-cache.js';
-import type { RateLimiter } from '../../src/rate-limiter.js';
-import { MetricsExporter } from '../../src/metrics-exporter.js';
+import { DiscoveryRequestHandler } from '../../src/core/handlers/discovery-request-handler.js';
+import type { MCPClientPool } from '../../src/mcp/client-pool.js';
+import type { SchemaCache } from '../../src/validation/schema-cache.js';
+import type { RateLimiter } from '../../src/security/rate-limiter.js';
+import { MetricsExporter } from '../../src/observability/metrics-exporter.js';
 import type { ToolSchema } from '../../src/types/discovery.js';
 import type { IncomingMessage, ServerResponse } from 'http';
 
