@@ -192,8 +192,10 @@ Args:
     - read (string[]): Allowed read paths
     - write (string[]): Allowed write paths
     - net (string[]): Allowed network hosts
-  - skipDangerousPatternCheck (boolean): Skip dangerous pattern validation (optional, default: false)
-    Can be overridden by CODE_EXECUTOR_SKIP_DANGEROUS_PATTERNS env var or config file
+  - skipDangerousPatternCheck (boolean): Accepted for backward compatibility but IGNORED (issue #56)
+    Per-call skipping is intentionally disabled so a caller cannot bypass the check.
+    Validation can only be disabled SERVER-SIDE via the CODE_EXECUTOR_SKIP_DANGEROUS_PATTERNS
+    env var (=true) or the security.skipDangerousPatternCheck config option (operator decision).
     NOTE: Dangerous pattern validation is defense-in-depth only, NOT a security boundary
     Real security comes from sandbox permissions, resource limits, and process isolation
 
@@ -222,7 +224,7 @@ Example:
             write: z.array(z.string()).optional(),
             net: z.array(z.string()).optional(),
           }).default({}).describe('Deno sandbox permissions'),
-          skipDangerousPatternCheck: z.boolean().optional().describe('Skip dangerous pattern validation (defense-in-depth only)'),
+          skipDangerousPatternCheck: z.boolean().optional().describe('Accepted but IGNORED for security (issue #56): per-call skipping is disabled. Validation can only be disabled server-side via the CODE_EXECUTOR_SKIP_DANGEROUS_PATTERNS env var or security.skipDangerousPatternCheck config option.'),
           enableSampling: z.boolean().optional().default(false).describe('Enable LLM sampling (llm.ask/llm.think helpers)'),
           maxSamplingRounds: z.number().int().min(1).max(100).optional().default(10).describe('Max sampling rounds'),
           maxSamplingTokens: z.number().int().min(100).max(100000).optional().default(10000).describe('Max sampling tokens'),
@@ -453,8 +455,10 @@ Args:
     Example: ['mcp__zen__codereview', 'mcp__filesystem__read_file']
   - timeoutMs (number): Execution timeout in milliseconds (default: 30000)
   - permissions (object): Subprocess permissions (limited to temp directory and localhost)
-  - skipDangerousPatternCheck (boolean): Skip dangerous pattern validation (optional, default: false)
-    Can be overridden by CODE_EXECUTOR_SKIP_DANGEROUS_PATTERNS env var or config file
+  - skipDangerousPatternCheck (boolean): Accepted for backward compatibility but IGNORED (issue #56)
+    Per-call skipping is intentionally disabled so a caller cannot bypass the check.
+    Validation can only be disabled SERVER-SIDE via the CODE_EXECUTOR_SKIP_DANGEROUS_PATTERNS
+    env var (=true) or the security.skipDangerousPatternCheck config option (operator decision).
     NOTE: Dangerous pattern validation is defense-in-depth only, NOT a security boundary
     Real security comes from sandbox permissions, resource limits, and process isolation
 
@@ -483,7 +487,7 @@ Example:
             write: z.array(z.string()).optional(),
             net: z.array(z.string()).optional(),
           }).default({}).describe('Subprocess permissions'),
-          skipDangerousPatternCheck: z.boolean().optional().describe('Skip dangerous pattern validation (defense-in-depth only)'),
+          skipDangerousPatternCheck: z.boolean().optional().describe('Accepted but IGNORED for security (issue #56): per-call skipping is disabled. Validation can only be disabled server-side via the CODE_EXECUTOR_SKIP_DANGEROUS_PATTERNS env var or security.skipDangerousPatternCheck config option.'),
           enableSampling: z.boolean().optional().default(false).describe('Enable LLM sampling (llm.ask/llm.think helpers)'),
           maxSamplingRounds: z.number().int().min(1).max(100).optional().default(10).describe('Max sampling rounds'),
           maxSamplingTokens: z.number().int().min(100).max(100000).optional().default(10000).describe('Max sampling tokens'),
