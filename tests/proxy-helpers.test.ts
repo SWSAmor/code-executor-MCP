@@ -3,7 +3,7 @@
  */
 
 import { describe, it, expect, beforeEach } from 'vitest';
-import { AllowlistValidator, ToolCallTracker } from '../src/proxy-helpers.js';
+import { AllowlistValidator, ToolCallTracker } from '../src/mcp/proxy-helpers.js';
 
 describe('AllowlistValidator', () => {
   describe('validate', () => {

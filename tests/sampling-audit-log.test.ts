@@ -11,7 +11,7 @@ import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { promises as fs } from 'fs';
 import * as path from 'path';
 import * as crypto from 'crypto';
-import { SamplingAuditLogger, resetSamplingAuditLogger } from '../src/sampling-audit-logger.js';
+import { SamplingAuditLogger, resetSamplingAuditLogger } from '../src/observability/sampling-audit-logger.js';
 import type { SamplingAuditEntry } from '../src/types.js';
 
 // Test instance

@@ -4,7 +4,7 @@
 
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { HealthCheckServer } from '../src/core/server/health-check.js';
-import { MCPClientPool } from '../src/mcp-client-pool.js';
+import { MCPClientPool } from '../src/mcp/client-pool.js';
 import { ConnectionPool } from '../src/mcp/connection-pool.js';
 
 describe('HealthCheckServer', () => {

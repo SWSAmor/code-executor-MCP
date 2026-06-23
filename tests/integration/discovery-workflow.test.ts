@@ -7,9 +7,9 @@
  */
 
 import { describe, it, expect, beforeAll, beforeEach, afterEach, vi } from 'vitest';
-import { executeTypescriptInSandbox } from '../../src/sandbox-executor.js';
-import { initConfig } from '../../src/config.js';
-import type { MCPClientPool } from '../../src/mcp-client-pool.js';
+import { executeTypescriptInSandbox } from '../../src/executors/sandbox-executor.js';
+import { initConfig } from '../../src/config/loader.js';
+import type { MCPClientPool } from '../../src/mcp/client-pool.js';
 import type { SandboxOptions } from '../../src/types.js';
 
 describe('Discovery + Execution Workflow Integration (US6)', () => {

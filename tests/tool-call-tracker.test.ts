@@ -1,5 +1,5 @@
 import { beforeEach, describe, expect, it } from 'vitest';
-import { ToolCallTracker } from '../src/proxy-helpers.js';
+import { ToolCallTracker } from '../src/mcp/proxy-helpers.js';
 
 describe('ToolCallTracker summary aggregation', () => {
   let tracker: ToolCallTracker;
