@@ -172,10 +172,23 @@ export class SecurityValidator {
     if (!skipDangerousPatternCheck) {
       for (const pattern of DANGEROUS_PATTERNS) {
         if (pattern.test(code)) {
-          // SECURITY: Use generic error message to avoid revealing exact pattern
+          // SECURITY: Use generic message — never reveal which pattern matched.
+          // The message states the block is TERMINAL and names the working
+          // server-side bypass, so callers stop retry-looping reworded variants
+          // on a non-retryable refusal (see issue #7). Note: the per-call
+          // skipDangerousPatternCheck request param is intentionally ignored
+          // (issue #56) — only the env var / config option can disable this.
           errors.push(
-            `Code contains potentially dangerous pattern. ` +
-            `This pattern is blocked as defense-in-depth protection.`
+            `Code contains a potentially dangerous pattern and was blocked as ` +
+            `defense-in-depth protection. This is a terminal validation result, ` +
+            `not a transient error — do not retry with reworded code, as the ` +
+            `block will recur. If the token appears only as text or data (e.g. ` +
+            `inside a string, comment, or documentation) and the call is ` +
+            `legitimate, an operator can disable this server-side check by ` +
+            `setting the CODE_EXECUTOR_SKIP_DANGEROUS_PATTERNS=true environment ` +
+            `variable (or the security.skipDangerousPatternCheck config option). ` +
+            `The per-call skipDangerousPatternCheck request parameter is ` +
+            `intentionally ignored for security and cannot bypass this check.`
           );
         }
       }

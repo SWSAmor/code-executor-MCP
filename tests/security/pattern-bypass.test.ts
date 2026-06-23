@@ -9,7 +9,7 @@
  */
 
 import { describe, it, expect, beforeEach } from 'vitest';
-import { SecurityValidator } from '../../src/security.js';
+import { SecurityValidator } from '../../src/validation/security-validator.js';
 
 describe('Dangerous Pattern Validation Bypass Attacks (P0 Security)', () => {
   let validator: SecurityValidator;
@@ -251,6 +251,42 @@ describe('Dangerous Pattern Validation Bypass Attacks (P0 Security)', () => {
 
       expect(result.valid).toBe(true);
       expect(result.errors.length).toBe(0);
+    });
+  });
+
+  describe('Terminal refusal message guidance (Issue #7)', () => {
+    // The refusal must tell the caller the block is TERMINAL (not a transient
+    // error) and name the working server-level bypass, so agents stop
+    // retry-looping reworded variants on a non-retryable refusal.
+    function firstError(code: string): string {
+      const result = validator.validateCode(code);
+      expect(result.valid).toBe(false);
+      expect(result.errors.length).toBeGreaterThan(0);
+      return result.errors[0];
+    }
+
+    it('should_keep_dangerousPattern_phrase_for_backCompat', () => {
+      // Existing consumers assert on this substring — must be preserved.
+      expect(firstError('eval("x")')).toContain('dangerous pattern');
+    });
+
+    it('should_state_refusal_is_terminal', () => {
+      const msg = firstError('eval("x")');
+      expect(msg).toMatch(/terminal/i);
+      expect(msg).toMatch(/do not retry/i);
+    });
+
+    it('should_name_working_serverLevel_bypass_envVar', () => {
+      expect(firstError('eval("x")')).toContain('CODE_EXECUTOR_SKIP_DANGEROUS_PATTERNS');
+    });
+
+    it('should_clarify_perCall_param_is_ignored', () => {
+      // The per-call skipDangerousPatternCheck request param is intentionally
+      // ignored (Issue #56). The message must not mislead callers into retrying
+      // with it.
+      const msg = firstError('eval("x")');
+      expect(msg).toMatch(/skipDangerousPatternCheck/);
+      expect(msg).toMatch(/ignored/i);
     });
   });
 });
