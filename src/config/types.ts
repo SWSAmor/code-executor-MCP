@@ -30,6 +30,15 @@ export type RateLimitConfig = z.infer<typeof RateLimitConfigSchema>;
  * - queueTimeoutMs: 1s-5min ensures reasonable wait times
  * - connectTimeoutMs: 1s-2min caps how long a single downstream MCP server may
  *   take to connect, so one slow/unreachable server cannot stall pool startup
+ * - startupConcurrency: 1-64 caps how many downstream servers spawn+handshake at
+ *   once. Connecting all servers simultaneously (unbounded Promise.all) makes many
+ *   cold-starting `uvx`/`npx` children contend for CPU/IO — a "thundering herd"
+ *   that pushes the slowest server (e.g. basic-memory) over connectTimeoutMs. A
+ *   bounded window keeps startup fast while removing that contention.
+ * - startupRetries: 0-5 extra connect attempts for servers that missed the first
+ *   window. Retries run serially AFTER the initial batch settles — with the herd
+ *   gone, a slow server gets the machine to itself and connects on the retry
+ *   instead of being dropped for the whole process lifetime.
  */
 export const PoolConfigSchema = z.object({
   /** Maximum concurrent requests (default: 100) */
@@ -38,8 +47,12 @@ export const PoolConfigSchema = z.object({
   queueSize: z.number().int().min(1).max(1000).default(200),
   /** Queue timeout in milliseconds (default: 30000ms = 30s) */
   queueTimeoutMs: z.number().int().min(1000).max(300000).default(30000),
-  /** Per-server connect timeout in milliseconds (default: 15000ms = 15s) */
-  connectTimeoutMs: z.number().int().min(1000).max(120000).default(15000),
+  /** Per-server connect timeout in milliseconds (default: 20000ms = 20s) */
+  connectTimeoutMs: z.number().int().min(1000).max(120000).default(20000),
+  /** Max downstream servers connecting concurrently at startup (default: 6) */
+  startupConcurrency: z.number().int().min(1).max(64).default(6),
+  /** Serial connect retries for servers that missed the first window (default: 1) */
+  startupRetries: z.number().int().min(0).max(5).default(1),
 });
 
 export type PoolConfig = z.infer<typeof PoolConfigSchema>;

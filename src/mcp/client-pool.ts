@@ -22,6 +22,57 @@ import type { SchemaCache } from '../validation/schema-cache.js';
 import { ConnectionQueue } from './connection-queue.js';
 import type { MetricsExporter } from '../observability/metrics-exporter.js';
 
+/** Result of a single downstream-server connect attempt (used by initialize()). */
+interface ConnectOutcome {
+  serverName: string;
+  ok: boolean;
+  /** Wall-clock duration of the (last) attempt, ms. */
+  ms: number;
+  /** Failure message, present only when ok === false. */
+  error?: string;
+  /** True when the server connected on a retry rather than the first window. */
+  viaRetry?: boolean;
+}
+
+/**
+ * Run `worker` over `items` with at most `limit` in flight at once, preserving
+ * input order in the returned array. A bounded alternative to
+ * `Promise.all(items.map(worker))` for when unbounded fan-out would overload a
+ * shared resource — here, many cold-starting downstream MCP children spawning
+ * simultaneously and starving each other's connect handshake.
+ *
+ * Uses a fixed set of `limit` runners pulling from a shared cursor (sliding
+ * window), so a fast item never waits behind a slow one in the same batch. The
+ * cursor read+increment is synchronous (single-threaded event loop), so no lock
+ * is needed. `worker` is expected not to throw — callers wrap per-item errors
+ * into a result object; a throw rejects the whole run, matching Promise.all.
+ */
+export async function mapWithConcurrency<T, R>(
+  items: readonly T[],
+  limit: number,
+  worker: (item: T, index: number) => Promise<R>
+): Promise<R[]> {
+  const results = new Array<R>(items.length);
+  let next = 0;
+  // Defensive: a non-finite or <1 limit must never yield 0 workers, which would
+  // leave `results` holes (undefined) and silently drop items. Fall back to
+  // serial (1) so every item is still processed.
+  const safeLimit = Number.isFinite(limit) && limit >= 1 ? Math.floor(limit) : 1;
+  const workerCount = Math.min(safeLimit, items.length);
+  const runners: Promise<void>[] = [];
+  for (let w = 0; w < workerCount; w++) {
+    runners.push(
+      (async () => {
+        for (let current = next++; current < items.length; current = next++) {
+          results[current] = await worker(items[current]!, current);
+        }
+      })()
+    );
+  }
+  await Promise.all(runners);
+  return results;
+}
+
 /**
  * MCP Client Pool Configuration (US4: FR-4)
  *
@@ -47,8 +98,12 @@ export interface MCPClientPoolConfig {
   queueSize?: number;
   /** Queue timeout in milliseconds (default: 30000ms = 30s) */
   queueTimeoutMs?: number;
-  /** Per-server connect timeout in milliseconds (default: 15000ms = 15s) */
+  /** Per-server connect timeout in milliseconds (default: 20000ms = 20s) */
   connectTimeoutMs?: number;
+  /** Max downstream servers connecting concurrently at startup (default: 6) */
+  startupConcurrency?: number;
+  /** Serial connect retries for servers that missed the first window (default: 1) */
+  startupRetries?: number;
 }
 
 /**
@@ -72,6 +127,15 @@ export class MCPClientPool implements IToolSchemaProvider {
   // never stall pool startup (which would delay the upstream MCP handshake and
   // trigger a supervisor restart loop). See connectStdio/connectHttp.
   private connectTimeoutMs: number;
+
+  // Startup fan-out control. connectToServer() for all configured servers used to
+  // run under one unbounded Promise.all — every cold-starting `uvx`/`npx` child
+  // spawning at once contends for CPU/IO (a "thundering herd") and pushes the
+  // slowest server over connectTimeoutMs. startupConcurrency bounds how many
+  // connect at once; startupRetries re-attempts the ones that missed the first
+  // window, serially, after the herd has cleared. See initialize().
+  private startupConcurrency: number;
+  private startupRetries: number;
 
   // STDIO transports that have spawned a child process but whose connect() has
   // not yet resolved. Tracked here so a child can still be reaped if the whole
@@ -115,6 +179,10 @@ export class MCPClientPool implements IToolSchemaProvider {
 
     // Per-server connect timeout (Priority: explicit config > env-validated default)
     this.connectTimeoutMs = config?.connectTimeoutMs ?? poolConfig.connectTimeoutMs;
+
+    // Startup fan-out control (Priority: explicit config > env-validated default)
+    this.startupConcurrency = config?.startupConcurrency ?? poolConfig.startupConcurrency;
+    this.startupRetries = config?.startupRetries ?? poolConfig.startupRetries;
 
     // T053: Initialize connection queue
     this.connectionQueue = new ConnectionQueue({
@@ -344,24 +412,71 @@ export class MCPClientPool implements IToolSchemaProvider {
       // server can never block the others — failures degrade gracefully and the
       // pool comes up with whatever connected. A failed server is NEVER added to
       // `clients`/`toolCache`, so its tools are not discoverable or callable.
+      //
+      // Fan-out is bounded (startupConcurrency) instead of one unbounded
+      // Promise.all: connecting every server at once makes cold-starting
+      // `uvx`/`npx` children contend for CPU/IO and pushes the slowest (e.g.
+      // basic-memory) past connectTimeoutMs. Servers that still miss the window
+      // are retried serially (startupRetries) once the herd has cleared.
       const serverNames = filteredServers.map(([name]) => name);
-      const outcomes = await Promise.all(
-        filteredServers.map(async ([serverName, serverConfig]) => {
-          const startedAt = Date.now();
-          try {
-            await this.connectToServer(serverName, serverConfig);
-            return { serverName, ok: true as const, ms: Date.now() - startedAt };
-          } catch (error) {
-            return {
-              serverName,
-              ok: false as const,
-              ms: Date.now() - startedAt,
-              error: error instanceof Error ? error.message : String(error),
-            };
-          }
-        })
-      );
+      const configByName = new Map<string, MCPServerConfig>(filteredServers);
 
+      const connectOne = async (
+        serverName: string,
+        serverConfig: MCPServerConfig
+      ): Promise<ConnectOutcome> => {
+        const startedAt = Date.now();
+        try {
+          await this.connectToServer(serverName, serverConfig);
+          return { serverName, ok: true, ms: Date.now() - startedAt };
+        } catch (error) {
+          return {
+            serverName,
+            ok: false,
+            ms: Date.now() - startedAt,
+            error: error instanceof Error ? error.message : String(error),
+          };
+        }
+      };
+
+      // First window: bounded-concurrency connect across all servers.
+      const outcomeByName = new Map<string, ConnectOutcome>();
+      const firstRound = await mapWithConcurrency(
+        filteredServers,
+        this.startupConcurrency,
+        ([serverName, serverConfig]) => connectOne(serverName, serverConfig)
+      );
+      for (const outcome of firstRound) {
+        outcomeByName.set(outcome.serverName, outcome);
+      }
+
+      // Serial retry for servers that missed the first window. With the herd
+      // gone, a slow server usually connects immediately on the retry instead of
+      // being dropped for the whole process lifetime (there is no lazy reconnect).
+      for (let attempt = 1; attempt <= this.startupRetries; attempt++) {
+        const stillFailed = [...outcomeByName.values()].filter(o => !o.ok);
+        if (stillFailed.length === 0) {
+          break;
+        }
+        console.error(
+          `🔁 Retry ${attempt}/${this.startupRetries} for ${stillFailed.length} server(s) that missed the startup window: ${stillFailed.map(o => o.serverName).join(', ')}`
+        );
+        for (const failed of stillFailed) {
+          const serverConfig = configByName.get(failed.serverName);
+          if (!serverConfig) {
+            continue;
+          }
+          const retried = await connectOne(failed.serverName, serverConfig);
+          if (retried.ok) {
+            retried.viaRetry = true;
+          }
+          outcomeByName.set(failed.serverName, retried);
+        }
+      }
+
+      // Report in original config order (Map preserves insertion order, but be
+      // explicit so a future config-merge change can't reorder the report).
+      const outcomes = serverNames.map(name => outcomeByName.get(name)!);
       const failures = outcomes.filter(o => !o.ok);
       const successes = outcomes.length - failures.length;
 
@@ -374,7 +489,7 @@ export class MCPClientPool implements IToolSchemaProvider {
         console.error(`📋 MCP server startup report (${successes}/${serverNames.length} connected):`);
         for (const o of outcomes) {
           if (o.ok) {
-            console.error(`  ✓ ${o.serverName} (${o.ms}ms)`);
+            console.error(`  ✓ ${o.serverName} (${o.ms}ms)${o.viaRetry ? ' [via retry]' : ''}`);
           } else {
             console.error(`  ✗ ${o.serverName} (${o.ms}ms): ${o.error}`);
           }

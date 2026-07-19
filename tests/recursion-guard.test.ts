@@ -39,7 +39,9 @@ describe('recursion guard', () => {
       maxConcurrent: 100,
       queueSize: 200,
       queueTimeoutMs: 30000,
-      connectTimeoutMs: 15000,
+      connectTimeoutMs: 20000,
+      startupConcurrency: 6,
+      startupRetries: 1,
     });
 
     pool = new MCPClientPool();

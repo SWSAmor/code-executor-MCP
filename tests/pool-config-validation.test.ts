@@ -21,6 +21,8 @@ describe('Pool Configuration Validation (SEC-002)', () => {
     delete process.env.POOL_QUEUE_SIZE;
     delete process.env.POOL_QUEUE_TIMEOUT_MS;
     delete process.env.POOL_CONNECT_TIMEOUT_MS;
+    delete process.env.POOL_STARTUP_CONCURRENCY;
+    delete process.env.POOL_STARTUP_RETRIES;
   });
 
   afterEach(() => {
@@ -35,7 +37,61 @@ describe('Pool Configuration Validation (SEC-002)', () => {
       expect(config.maxConcurrent).toBe(100);
       expect(config.queueSize).toBe(200);
       expect(config.queueTimeoutMs).toBe(30000);
-      expect(config.connectTimeoutMs).toBe(15000);
+      expect(config.connectTimeoutMs).toBe(20000);
+      expect(config.startupConcurrency).toBe(6);
+      expect(config.startupRetries).toBe(1);
+    });
+  });
+
+  describe('Startup fan-out config (concurrency + retries)', () => {
+    it('should_parseValidValues_when_startupEnvVarsSet', () => {
+      process.env.POOL_STARTUP_CONCURRENCY = '4';
+      process.env.POOL_STARTUP_RETRIES = '2';
+
+      const config = getPoolConfig();
+
+      expect(config.startupConcurrency).toBe(4);
+      expect(config.startupRetries).toBe(2);
+    });
+
+    it('should_acceptZeroRetries_when_retriesDisabled', () => {
+      process.env.POOL_STARTUP_RETRIES = '0'; // 0 is valid: disables retry
+
+      expect(getPoolConfig().startupRetries).toBe(0);
+    });
+
+    it('should_acceptBounds_when_atLimits', () => {
+      process.env.POOL_STARTUP_CONCURRENCY = '64'; // max
+      process.env.POOL_STARTUP_RETRIES = '5'; // max
+
+      const config = getPoolConfig();
+
+      expect(config.startupConcurrency).toBe(64);
+      expect(config.startupRetries).toBe(5);
+    });
+
+    it('should_throwZodError_when_startupConcurrencyZero', () => {
+      process.env.POOL_STARTUP_CONCURRENCY = '0'; // min is 1
+
+      expect(() => getPoolConfig()).toThrow();
+    });
+
+    it('should_throwZodError_when_startupConcurrencyExceedsMax', () => {
+      process.env.POOL_STARTUP_CONCURRENCY = '65'; // max is 64
+
+      expect(() => getPoolConfig()).toThrow();
+    });
+
+    it('should_throwZodError_when_startupRetriesNegative', () => {
+      process.env.POOL_STARTUP_RETRIES = '-1'; // min is 0
+
+      expect(() => getPoolConfig()).toThrow();
+    });
+
+    it('should_throwZodError_when_startupRetriesExceedsMax', () => {
+      process.env.POOL_STARTUP_RETRIES = '6'; // max is 5
+
+      expect(() => getPoolConfig()).toThrow();
     });
   });
 
