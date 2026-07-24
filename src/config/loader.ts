@@ -591,3 +591,33 @@ export function getHttpAuthToken(): string | undefined {
   const token = process.env.CODE_EXECUTOR_HTTP_TOKEN;
   return token && token.length > 0 ? token : undefined;
 }
+
+/**
+ * Idle-teardown window (ms) for the shared downstream MCP pool.
+ *
+ * `0` (the default) means DISABLED — the pool is built eagerly at startup and
+ * kept warm for the process lifetime (today's behavior, and the stdio default).
+ * When `> 0`, the resident HTTP service builds the pool LAZILY on the first tool
+ * call and tears it down after this many ms with zero connected sessions, so an
+ * idle resident service reclaims its ~15 downstream children; the next tool call
+ * rebuilds the pool. Set via `CODE_EXECUTOR_POOL_IDLE_MS`.
+ *
+ * **WHY clamp/disable instead of throw:** this governs a RESIDENT service's
+ * startup. A throw on a bad value would crash the service (mirroring the
+ * shutdown-knob rationale in {@link getBoundedEnvMs}), so a non-numeric or
+ * non-positive value falls back to disabled (eager) and an out-of-range value is
+ * clamped — never fatal.
+ */
+export const DEFAULT_POOL_IDLE_MS = 0; // disabled → eager pool
+const MIN_POOL_IDLE_MS = 1_000; // 1s floor when enabled
+const MAX_POOL_IDLE_MS = 24 * 60 * 60 * 1_000; // 24h ceiling
+
+export function getPoolIdleMs(): number {
+  const raw = process.env.CODE_EXECUTOR_POOL_IDLE_MS;
+  if (!raw) return DEFAULT_POOL_IDLE_MS;
+  const parsed = parseInt(raw, 10);
+  if (isNaN(parsed) || parsed <= 0) return DEFAULT_POOL_IDLE_MS; // 0/invalid → disabled
+  if (parsed < MIN_POOL_IDLE_MS) return MIN_POOL_IDLE_MS;
+  if (parsed > MAX_POOL_IDLE_MS) return MAX_POOL_IDLE_MS;
+  return parsed;
+}

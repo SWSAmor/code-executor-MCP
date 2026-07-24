@@ -33,6 +33,7 @@ import {
   getHttpHost,
   isHttpAuthEnabled,
   getHttpAuthToken,
+  getPoolIdleMs,
 } from '../config/loader.js';
 import { VERSION } from '../version.js';
 
@@ -92,7 +93,10 @@ export async function runHttpServer(): Promise<void> {
   // then kick off the downstream pool + health server. All sessions share it.
   const core = new SharedCore();
   await core.initialize();
-  await core.startBackgroundServices();
+  // In HTTP mode the pool may be built lazily and torn down when idle so a
+  // resident service reclaims its downstream children between uses (0 = eager).
+  const poolIdleMs = getPoolIdleMs();
+  await core.startBackgroundServices({ poolIdleMs });
 
   const port = getHttpPort();
   const host = getHttpHost();
@@ -100,6 +104,18 @@ export async function runHttpServer(): Promise<void> {
 
   // One transport (+ its own McpServer) per live MCP session, keyed by session id.
   const sessions = new Map<string, StreamableHTTPServerTransport>();
+
+  /**
+   * Forget a session exactly once and notify the core's idle accounting. Both
+   * `onsessionclosed` and `transport.onclose` can fire for the same session, so
+   * the decrement is gated on the Map actually having held the id.
+   */
+  function closeSession(id: string | undefined): void {
+    if (id && sessions.delete(id)) {
+      core.onSessionClose();
+      console.error(`MCP session closed: ${id} (active: ${sessions.size})`);
+    }
+  }
 
   /** Create a fresh per-session transport + McpServer sharing the one core. */
   async function openSession(): Promise<StreamableHTTPServerTransport> {
@@ -113,18 +129,12 @@ export async function runHttpServer(): Promise<void> {
       allowedHosts,
       onsessioninitialized: (id) => {
         sessions.set(id, transport);
+        core.onSessionOpen();
         console.error(`MCP session opened: ${id} (active: ${sessions.size})`);
       },
-      onsessionclosed: (id) => {
-        sessions.delete(id);
-        console.error(`MCP session closed: ${id} (active: ${sessions.size})`);
-      },
+      onsessionclosed: (id) => closeSession(id),
     });
-    transport.onclose = () => {
-      if (transport.sessionId) {
-        sessions.delete(transport.sessionId);
-      }
-    };
+    transport.onclose = () => closeSession(transport.sessionId);
 
     const server = new McpServer({ name: 'code-executor-mcp-server', version: VERSION });
     registerTools(core, server, sessionId);

@@ -66,19 +66,33 @@ export class SharedCore {
   rateLimiter: RateLimiter | null = null;
   denoAvailable = false;
   // Resolves when the downstream MCP client pool has finished initializing.
-  // The pool is initialized in the BACKGROUND (see startBackgroundServices) so
-  // the upstream MCP handshake is never blocked by slow/unreachable downstream
-  // servers. Tool handlers await this before executing so downstream tools are
-  // ready (or have been determined unavailable) by the time code runs.
+  // The pool is initialized in the BACKGROUND (see startBackgroundServices /
+  // ensurePoolReady) so the upstream MCP handshake is never blocked by slow/
+  // unreachable downstream servers. Tool handlers call ensurePoolReady() and
+  // await this before executing so downstream tools are ready (or have been
+  // determined unavailable) by the time code runs.
   poolReady: Promise<void> = Promise.resolve();
   private healthCheckServer: HealthCheckServer | null = null;
   private shutdownInProgress = false; // P1: Prevent concurrent shutdown attempts
 
-  constructor() {
+  // Lazy/idle downstream pool (resident HTTP mode). When idleMs === 0 the pool is
+  // eager and kept warm for the process lifetime (stdio default, unchanged). When
+  // idleMs > 0 it is built on the first tool call (see ensurePoolReady) and torn
+  // down after idleMs with zero active sessions, then rebuilt on demand.
+  private poolInitStarted = false;
+  private idleMs = 0;
+  private activeSessions = 0;
+  private idleTimer: ReturnType<typeof setTimeout> | null = null;
+
+  /**
+   * @param deps - Optional injected collaborators (tests). Production callers
+   *   pass nothing, so the pool/connection-pool are built here as before.
+   */
+  constructor(deps?: { mcpClientPool?: MCPClientPool; connectionPool?: ConnectionPool }) {
     // Initialize components
-    this.mcpClientPool = new MCPClientPool();
+    this.mcpClientPool = deps?.mcpClientPool ?? new MCPClientPool();
     this.securityValidator = new SecurityValidator();
-    this.connectionPool = new ConnectionPool(100); // Max 100 concurrent executions
+    this.connectionPool = deps?.connectionPool ?? new ConnectionPool(100); // Max 100 concurrent executions
   }
 
   /**
@@ -118,25 +132,30 @@ export class SharedCore {
 
   /**
    * Post-transport background services: kick off the downstream MCP client pool
-   * (in the background — not awaited) and start the optional health-check server.
+   * (eager mode — in the background, not awaited) and start the optional
+   * health-check server.
+   *
+   * @param options.poolIdleMs - Idle-teardown window. `0`/omitted keeps the pool
+   *   eager (built now, warm for the process lifetime — stdio default). `> 0`
+   *   defers the build to the first tool call and tears the pool down after this
+   *   many ms with no sessions (resident HTTP mode; see {@link getPoolIdleMs}).
    */
-  async startBackgroundServices(): Promise<void> {
-    // Initialize MCP client pool in the background. Tool handlers await
-    // `poolReady` before executing (see registerTools). Failures are logged but
-    // never crash the server — code-executor keeps serving whatever connected.
-    console.error('Initializing MCP client pool...');
-    this.poolReady = this.mcpClientPool
-      .initialize()
-      .then(() => {
-        const tools = this.mcpClientPool.listAllTools();
-        console.error(`Connected to ${tools.length} MCP tools across multiple servers`);
-      })
-      .catch((error) => {
-        const message = error instanceof Error ? error.message : String(error);
-        console.error(
-          `MCP client pool initialization failed — continuing without downstream tools: ${message}`
-        );
-      });
+  async startBackgroundServices(options?: { poolIdleMs?: number }): Promise<void> {
+    this.idleMs = options?.poolIdleMs && options.poolIdleMs > 0 ? options.poolIdleMs : 0;
+
+    if (this.idleMs === 0) {
+      // Eager: initialize the downstream pool now, in the background. Tool
+      // handlers await ensurePoolReady() (which returns this same promise)
+      // before executing. Failures are logged but never crash the server.
+      this.ensurePoolReady();
+    } else {
+      // Lazy: defer the build to the first tool call so a resident service with
+      // no connected host stays lightweight; it is torn down after idleMs with
+      // no sessions and rebuilt on demand.
+      console.error(
+        `Lazy downstream pool: build on first tool call, tear down after ${this.idleMs}ms idle`
+      );
+    }
 
     // Initialize health check server (optional, enabled via env var)
     const enableHealthCheck = process.env.ENABLE_HEALTH_CHECK !== 'false';
@@ -156,6 +175,102 @@ export class SharedCore {
         this.healthCheckServer = null;
       }
     }
+  }
+
+  /**
+   * Ensure the downstream MCP client pool is initializing (or already
+   * initialized) and return a promise that resolves when it is ready.
+   *
+   * Idempotent: `poolInitStarted` is flipped synchronously (single-threaded
+   * event loop), so concurrent callers share one in-flight initialization — no
+   * lock needed. In eager mode {@link startBackgroundServices} calls this once
+   * at startup; tool handlers then await an already-started init. In lazy mode
+   * the FIRST tool call triggers the build, and after an idle teardown the flag
+   * is reset so the next call rebuilds the pool.
+   *
+   * Failures are logged but never rejected — code-executor keeps serving with
+   * whatever downstream tools connected (or none).
+   */
+  ensurePoolReady(): Promise<void> {
+    if (!this.poolInitStarted) {
+      this.poolInitStarted = true;
+      console.error('Initializing MCP client pool...');
+      this.poolReady = this.mcpClientPool
+        .initialize()
+        .then(() => {
+          const tools = this.mcpClientPool.listAllTools();
+          console.error(`Connected to ${tools.length} MCP tools across multiple servers`);
+        })
+        .catch((error) => {
+          const message = error instanceof Error ? error.message : String(error);
+          console.error(
+            `MCP client pool initialization failed — continuing without downstream tools: ${message}`
+          );
+        });
+    }
+    return this.poolReady;
+  }
+
+  /**
+   * Record that a host session connected (HTTP transport). Cancels any pending
+   * idle teardown so the pool stays warm while at least one host is connected.
+   */
+  onSessionOpen(): void {
+    this.activeSessions++;
+    this.cancelIdleTimer();
+  }
+
+  /**
+   * Record that a host session closed. When the LAST session closes (and idle
+   * teardown is enabled), arm the timer that reclaims the downstream pool.
+   */
+  onSessionClose(): void {
+    this.activeSessions = Math.max(0, this.activeSessions - 1);
+    if (this.idleMs > 0 && this.activeSessions === 0) {
+      this.armIdleTimer();
+    }
+  }
+
+  private armIdleTimer(): void {
+    this.cancelIdleTimer();
+    this.idleTimer = setTimeout(() => {
+      this.idleTimer = null;
+      void this.teardownIdlePool();
+    }, this.idleMs);
+    // Do not keep the event loop alive solely for this timer.
+    this.idleTimer.unref?.();
+  }
+
+  private cancelIdleTimer(): void {
+    if (this.idleTimer) {
+      clearTimeout(this.idleTimer);
+      this.idleTimer = null;
+    }
+  }
+
+  /**
+   * Tear down the downstream pool after an idle period with no sessions, so a
+   * resident service reclaims its ~15 downstream children when nobody is using
+   * it. Re-checked at fire time: a reconnected session or an in-flight execution
+   * defers teardown (the timer is re-armed in the latter case). After teardown
+   * `poolInitStarted` resets so the next tool call rebuilds the pool via
+   * {@link ensurePoolReady}.
+   */
+  private async teardownIdlePool(): Promise<void> {
+    if (this.activeSessions > 0) return; // a session reconnected during the window
+    if (!this.poolInitStarted) return; // nothing was built
+    if (this.connectionPool.getStats().active > 0) {
+      this.armIdleTimer(); // an execution is in flight — retry after another window
+      return;
+    }
+    console.error(`Downstream pool idle for ${this.idleMs}ms with no sessions — tearing down`);
+    try {
+      await this.mcpClientPool.disconnect();
+    } catch (error) {
+      console.error('Error tearing down idle downstream pool:', error);
+    }
+    this.poolInitStarted = false;
+    this.poolReady = Promise.resolve();
   }
 
   /**
@@ -182,6 +297,7 @@ export class SharedCore {
       return;
     }
     this.shutdownInProgress = true;
+    this.cancelIdleTimer(); // no idle teardown once a full shutdown is underway
 
     const shutdownStart = Date.now();
 
@@ -442,10 +558,11 @@ Example:
             };
           }
 
-          // Ensure the downstream MCP pool has finished initializing (it is set
-          // up in the background at startup) so callMCPTool/discovery see the
-          // connected servers. Bounded by per-server connect timeouts.
-          await core.poolReady;
+          // Ensure the downstream MCP pool is ready so callMCPTool/discovery see
+          // the connected servers. Eager mode: this awaits the startup build;
+          // lazy mode: the first call triggers (and later calls rebuild) it.
+          // Bounded by per-server connect timeouts.
+          await core.ensurePoolReady();
 
           // Execute code with connection pooling
           const result = await core.connectionPool.execute(async () => {
@@ -705,9 +822,10 @@ Example:
             };
           }
 
-          // Ensure the downstream MCP pool has finished initializing (background
-          // startup) before executing. Bounded by per-server connect timeouts.
-          await core.poolReady;
+          // Ensure the downstream MCP pool is ready before executing. Eager mode:
+          // awaits the startup build; lazy mode: the first call triggers (and
+          // later calls rebuild) it. Bounded by per-server connect timeouts.
+          await core.ensurePoolReady();
 
           // Execute code with connection pooling
           // Use Pyodide (secure) when PYTHON_SANDBOX_READY, otherwise native (insecure)
