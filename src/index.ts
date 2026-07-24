@@ -190,6 +190,17 @@ if (command === 'setup') {
       console.error('❌ Wrapper sync failed:', error);
       process.exit(1);
     });
+} else if (command === 'service') {
+  // Manage the resident launchd service that runs the single shared HTTP MCP
+  // endpoint (macOS): install | uninstall | status | restart. Argv-dispatched
+  // like `setup`/`sync-wrappers`; the resident server itself is selected by env
+  // (CODE_EXECUTOR_ROLE=http), which launchd sets via the plist.
+  import('./cli/service-cli.js')
+    .then((m) => m.runServiceCli(args.slice(1)))
+    .catch((error) => {
+      console.error('❌ service command failed:', error);
+      process.exit(1);
+    });
 } else {
   // Server startup flow.
   //
