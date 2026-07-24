@@ -103,8 +103,12 @@ export async function runHttpServer(): Promise<void> {
 
   /** Create a fresh per-session transport + McpServer sharing the one core. */
   async function openSession(): Promise<StreamableHTTPServerTransport> {
+    // Pre-generate the session id so it can scope this session's audit-log
+    // client id and rate-limit bucket: registerTools needs it now, whereas the
+    // transport would only assign transport.sessionId later, during initialize.
+    const sessionId = randomUUID();
     const transport = new StreamableHTTPServerTransport({
-      sessionIdGenerator: () => randomUUID(),
+      sessionIdGenerator: () => sessionId,
       enableDnsRebindingProtection: true,
       allowedHosts,
       onsessioninitialized: (id) => {
@@ -123,7 +127,7 @@ export async function runHttpServer(): Promise<void> {
     };
 
     const server = new McpServer({ name: 'code-executor-mcp-server', version: VERSION });
-    registerTools(core, server);
+    registerTools(core, server, sessionId);
     // Must finish connecting (wires onmessage + starts the transport) BEFORE the
     // initialize message is handled, or the first message would be dropped.
     await server.connect(transport);

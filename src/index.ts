@@ -61,8 +61,9 @@ class CodeExecutorServer {
     // Pre-tools shared setup: load config, detect Deno, init rate limiter.
     await this.core.initialize();
 
-    // Register tools (now that config is initialized and Deno checked)
-    registerTools(this.core, this.server);
+    // Register tools (now that config is initialized and Deno checked). One host
+    // per stdio process, so a fixed 'stdio' client id is used for audit/rate-limit.
+    registerTools(this.core, this.server, 'stdio');
 
     // Start stdio transport FIRST so the upstream MCP handshake (initialize +
     // tools/list) is answered immediately. The downstream client pool is then

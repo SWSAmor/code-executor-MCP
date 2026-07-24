@@ -259,16 +259,19 @@ export function handleToolError(error: unknown, errorType: ErrorType) {
 /**
  * Check rate limit before executing code
  *
- * Returns error response if rate limited, null otherwise.
+ * Returns error response if rate limited, null otherwise. `clientId` scopes the
+ * rate-limit bucket to the caller's session so one host cannot exhaust another
+ * host's budget (in HTTP mode a distinct id per session; 'stdio' over stdio).
  */
-export async function checkRateLimit(core: SharedCore): Promise<ReturnType<typeof handleToolError> | null> {
+export async function checkRateLimit(
+  core: SharedCore,
+  clientId: string
+): Promise<ReturnType<typeof handleToolError> | null> {
   if (!core.rateLimiter) {
     return null; // Rate limiting disabled
   }
 
-  // Use 'default' as client ID since MCP servers run locally
-  // In a networked environment, this would be the client IP
-  const result = await core.rateLimiter.checkLimit('default');
+  const result = await core.rateLimiter.checkLimit(clientId);
 
   if (!result.allowed) {
     const error = new Error(
@@ -284,8 +287,13 @@ export async function checkRateLimit(core: SharedCore): Promise<ReturnType<typeo
 
 /**
  * Register MCP tools on the given server, backed by the shared core.
+ *
+ * `clientId` identifies the calling session — a distinct id per HTTP session
+ * (so multiple hosts sharing one process are attributed and rate-limited
+ * independently), or 'stdio' for the one-host-per-process stdio transport. It
+ * is threaded into the rate-limit bucket and the audit-log client id.
  */
-export function registerTools(core: SharedCore, server: McpServer): void {
+export function registerTools(core: SharedCore, server: McpServer, clientId: string): void {
     // Tool 1: Execute TypeScript (only if Deno is available)
     if (core.denoAvailable) {
       const typescriptToolConfig: Parameters<McpServer['registerTool']>[1] = {
@@ -386,7 +394,7 @@ Example:
       const typescriptToolHandler: Parameters<McpServer['registerTool']>[2] = async (args: any, extra: RequestHandlerExtra<any, any>) => {
         try {
           // Check rate limit
-          const rateLimitError = await checkRateLimit(core);
+          const rateLimitError = await checkRateLimit(core, clientId);
           if (rateLimitError) {
             return rateLimitError;
           }
@@ -468,7 +476,7 @@ Example:
               executionTimeMs: result.executionTimeMs,
               success: result.success,
               error: result.error,
-              clientId: 'default', // MCP servers run locally
+              clientId, // per-session id (HTTP session id, or 'stdio')
               memoryUsage: process.memoryUsage().heapUsed,
             },
             input.code
@@ -649,7 +657,7 @@ Example:
       const pythonToolHandler: Parameters<McpServer['registerTool']>[2] = async (args: any, extra: RequestHandlerExtra<any, any>) => {
         try {
           // Check rate limit
-          const rateLimitError = await checkRateLimit(core);
+          const rateLimitError = await checkRateLimit(core, clientId);
           if (rateLimitError) {
             return rateLimitError;
           }
@@ -740,7 +748,7 @@ Example:
               executionTimeMs: result.executionTimeMs,
               success: result.success,
               error: result.error,
-              clientId: 'default', // MCP servers run locally
+              clientId, // per-session id (HTTP session id, or 'stdio')
               memoryUsage: process.memoryUsage().heapUsed,
             },
             input.code
