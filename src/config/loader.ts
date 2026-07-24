@@ -547,3 +547,47 @@ export function getClientCloseTimeoutMs(): number {
     MAX_CLIENT_CLOSE_TIMEOUT_MS
   );
 }
+
+/**
+ * HTTP server mode (single shared instance).
+ *
+ * When `CODE_EXECUTOR_ROLE=http`, the server runs one Streamable HTTP MCP
+ * endpoint on loopback that every host connects to (instead of each host
+ * spawning its own stdio child). The port is fixed/known so hosts can point a
+ * `url` at it; the host is ALWAYS loopback — a code-execution server must never
+ * bind a routable interface.
+ */
+export const DEFAULT_HTTP_PORT = 39273;
+const MIN_HTTP_PORT = 1024;
+const MAX_HTTP_PORT = 65535;
+
+/** Loopback TCP port for the HTTP MCP endpoint. `CODE_EXECUTOR_HTTP_PORT` (1024–65535). */
+export function getHttpPort(): number {
+  return getBoundedEnvMs(
+    process.env.CODE_EXECUTOR_HTTP_PORT,
+    DEFAULT_HTTP_PORT,
+    MIN_HTTP_PORT,
+    MAX_HTTP_PORT
+  );
+}
+
+/** Bind host for the HTTP MCP endpoint — loopback only, not configurable by design. */
+export function getHttpHost(): string {
+  return '127.0.0.1';
+}
+
+/**
+ * Whether the HTTP endpoint requires a bearer token. ON by default; a code-execution
+ * server on a TCP port is reachable by any local process (and browsers via
+ * DNS-rebinding), so auth is the norm. Disable only on a trusted single-user box
+ * via `CODE_EXECUTOR_HTTP_AUTH=off`.
+ */
+export function isHttpAuthEnabled(): boolean {
+  return process.env.CODE_EXECUTOR_HTTP_AUTH !== 'off';
+}
+
+/** The expected bearer token (`CODE_EXECUTOR_HTTP_TOKEN`), or undefined if unset. */
+export function getHttpAuthToken(): string | undefined {
+  const token = process.env.CODE_EXECUTOR_HTTP_TOKEN;
+  return token && token.length > 0 ? token : undefined;
+}
