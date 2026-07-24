@@ -159,39 +159,6 @@ export { executeTypescriptInSandbox as executeTypescript } from './executors/san
 // who need the runtime should `import('code-executor-mcp/dist/executors/pyodide-executor.js')`
 // directly. Avoiding a static re-export keeps pyodide out of `bun --compile` graphs.
 
-// Start server
-const server = new CodeExecutorServer();
-
-// P1: Graceful shutdown signal handlers (flag now in CodeExecutorServer class)
-const handleShutdownSignal = async (signal: string) => {
-  console.error(`Received ${signal}, initiating graceful shutdown...`);
-
-  try {
-    await server.shutdown(); // Internal flag protects against concurrent calls
-  } catch (error) {
-    console.error('Error during shutdown:', error);
-    process.exit(1);
-  }
-};
-
-process.on('SIGINT', () => void handleShutdownSignal('SIGINT'));
-process.on('SIGTERM', () => void handleShutdownSignal('SIGTERM'));
-// SIGHUP: controlling terminal / session leader went away (a common parent-death
-// signal). Treat it as a graceful shutdown rather than the default (terminate).
-process.on('SIGHUP', () => void handleShutdownSignal('SIGHUP'));
-
-// Synchronous last-resort cleanup. If the process exits without the async
-// graceful path completing (e.g. host sends SIGKILL after a timeout, or an
-// unexpected exit), this guarantees spawned downstream MCP children are killed
-// rather than left as orphans. Must be synchronous — no async work runs here.
-process.on('exit', () => {
-  try {
-    server.killChildrenSync();
-  } catch {
-    // Nothing actionable during exit.
-  }
-});
-
 // Argument parsing: Handle CLI commands
 const args = process.argv.slice(2);
 const command = args[0];
@@ -223,40 +190,83 @@ if (command === 'setup') {
       process.exit(1);
     });
 } else {
-  // Normal server startup flow (stdio MCP server).
+  // Server startup flow.
   //
   // Reroute console.log/info/debug to stderr BEFORE any server code runs. On
   // stdio, stdout is the JSON-RPC channel; a stray console.log corrupts it and
-  // strict hosts (e.g. Claude Desktop) reject the stream. See stdio-guard.ts.
-  // Scoped to server mode only — the CLI subcommands above keep stdout.
+  // strict hosts (e.g. Claude Desktop) reject the stream. Harmless in HTTP mode
+  // (where stdout is not a protocol channel). See stdio-guard.ts.
   redirectConsoleLogToStderr();
 
-  (async () => {
-    try {
-      const location = await detectMCPConfigLocation();
+  if (process.env.CODE_EXECUTOR_ROLE === 'http') {
+    // Single shared HTTP MCP server (typically launchd-managed): every host
+    // connects to one loopback endpoint instead of spawning its own child.
+    // Role is selected by env, NOT argv — bun --compile shifts argv.
+    import('./http/http-server.js')
+      .then((m) => m.runHttpServer())
+      .catch((error) => {
+        console.error('Fatal error (HTTP server):', error);
+        process.exit(1);
+      });
+  } else {
+    // Default: one stdio MCP server per host.
+    const server = new CodeExecutorServer();
 
-      if (!location.exists) {
-        // No configuration found - show instructions and exit
-        const toolName = getToolDisplayName(location.tool);
-
-        console.error('');
-        console.error('❌ No MCP configuration found');
-        console.error('');
-        console.error('📝 To configure code-executor-mcp, run:');
-        console.error('   code-executor-mcp setup');
-        console.error('');
-        console.error(`Configuration will be created at: ${location.path}`);
-        console.error(`For tool: ${toolName}`);
-        console.error('');
-
+    // P1: Graceful shutdown signal handlers (in-progress flag lives in the class).
+    const handleShutdownSignal = async (signal: string): Promise<void> => {
+      console.error(`Received ${signal}, initiating graceful shutdown...`);
+      try {
+        await server.shutdown(); // Internal flag protects against concurrent calls
+      } catch (error) {
+        console.error('Error during shutdown:', error);
         process.exit(1);
       }
+    };
+    process.on('SIGINT', () => void handleShutdownSignal('SIGINT'));
+    process.on('SIGTERM', () => void handleShutdownSignal('SIGTERM'));
+    // SIGHUP: controlling terminal / session leader went away (a common
+    // parent-death signal). Treat it as a graceful shutdown, not the default terminate.
+    process.on('SIGHUP', () => void handleShutdownSignal('SIGHUP'));
 
-      // Configuration exists - start server
-      await server.start();
-    } catch (error) {
-      console.error('Fatal error:', error);
-      process.exit(1);
-    }
-  })();
+    // Synchronous last-resort cleanup. If the process exits without the async
+    // graceful path completing (e.g. host sends SIGKILL after a timeout, or an
+    // unexpected exit), this guarantees spawned downstream MCP children are killed
+    // rather than left as orphans. Must be synchronous — no async work runs here.
+    process.on('exit', () => {
+      try {
+        server.killChildrenSync();
+      } catch {
+        // Nothing actionable during exit.
+      }
+    });
+
+    (async () => {
+      try {
+        const location = await detectMCPConfigLocation();
+
+        if (!location.exists) {
+          // No configuration found - show instructions and exit
+          const toolName = getToolDisplayName(location.tool);
+
+          console.error('');
+          console.error('❌ No MCP configuration found');
+          console.error('');
+          console.error('📝 To configure code-executor-mcp, run:');
+          console.error('   code-executor-mcp setup');
+          console.error('');
+          console.error(`Configuration will be created at: ${location.path}`);
+          console.error(`For tool: ${toolName}`);
+          console.error('');
+
+          process.exit(1);
+        }
+
+        // Configuration exists - start server
+        await server.start();
+      } catch (error) {
+        console.error('Fatal error:', error);
+        process.exit(1);
+      }
+    })();
+  }
 }
