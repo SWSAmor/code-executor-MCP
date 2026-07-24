@@ -323,6 +323,9 @@ export function shouldSkipDangerousPatternCheck(): boolean {
  * - POOL_MAX_CONCURRENT: Maximum concurrent requests (default: 100)
  * - POOL_QUEUE_SIZE: Queue size when at capacity (default: 200)
  * - POOL_QUEUE_TIMEOUT_MS: Queue timeout in ms (default: 30000)
+ * - POOL_CONNECT_TIMEOUT_MS: Per-server connect timeout in ms (default: 20000)
+ * - POOL_STARTUP_CONCURRENCY: Max servers connecting at once at startup (default: 6)
+ * - POOL_STARTUP_RETRIES: Serial connect retries for servers that missed the first window (default: 1)
  *
  * @returns Validated pool configuration with defaults
  * @throws {z.ZodError} If environment variables are invalid (non-numeric, out of bounds)
@@ -334,6 +337,8 @@ export function getPoolConfig(): PoolConfig {
       queueSize: parseEnvInt(process.env.POOL_QUEUE_SIZE, 'POOL_QUEUE_SIZE'),
       queueTimeoutMs: parseEnvInt(process.env.POOL_QUEUE_TIMEOUT_MS, 'POOL_QUEUE_TIMEOUT_MS'),
       connectTimeoutMs: parseEnvInt(process.env.POOL_CONNECT_TIMEOUT_MS, 'POOL_CONNECT_TIMEOUT_MS'),
+      startupConcurrency: parseEnvInt(process.env.POOL_STARTUP_CONCURRENCY, 'POOL_STARTUP_CONCURRENCY'),
+      startupRetries: parseEnvInt(process.env.POOL_STARTUP_RETRIES, 'POOL_STARTUP_RETRIES'),
     });
   } catch (error) {
     // WHY: Wrap Zod errors with user-friendly messages
@@ -343,7 +348,7 @@ export function getPoolConfig(): PoolConfig {
       const field = firstError?.path.join('.') || 'unknown';
       throw new Error(
         `Invalid pool configuration: ${field} - ${firstError?.message}. ` +
-        `Check environment variables: POOL_MAX_CONCURRENT (1-1000), POOL_QUEUE_SIZE (1-1000), POOL_QUEUE_TIMEOUT_MS (1000-300000), POOL_CONNECT_TIMEOUT_MS (1000-120000).`
+        `Check environment variables: POOL_MAX_CONCURRENT (1-1000), POOL_QUEUE_SIZE (1-1000), POOL_QUEUE_TIMEOUT_MS (1000-300000), POOL_CONNECT_TIMEOUT_MS (1000-120000), POOL_STARTUP_CONCURRENCY (1-64), POOL_STARTUP_RETRIES (0-5).`
       );
     }
     // Re-throw non-Zod errors (e.g., parseEnvInt errors)
