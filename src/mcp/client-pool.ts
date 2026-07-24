@@ -12,7 +12,8 @@ import { SSEClientTransport } from '@modelcontextprotocol/sdk/client/sse.js';
 import { EventEmitter } from 'events';
 import { execFileSync } from 'child_process';
 import * as fs from 'fs/promises';
-import { getPoolConfig } from '../config/loader.js';
+import { getPoolConfig, getChildShutdownTimeoutMs, getClientCloseTimeoutMs } from '../config/loader.js';
+import { killProcessGracefully } from './process-killer.js';
 import { isValidMCPToolName, normalizeError, isErrnoException } from '../utils/utils.js';
 import type { MCPConfig, MCPServerConfig, ToolInfo, ProcessInfo, StdioServerConfig, HttpServerConfig } from '../types.js';
 import { isStdioConfig, isHttpConfig } from '../types.js';
@@ -1037,82 +1038,80 @@ export class MCPClientPool implements IToolSchemaProvider {
   }
 
   /**
-   * Disconnect all clients and kill child processes
+   * Await `close()` but never let it hang shutdown.
    *
-   * Graceful shutdown: SIGTERM → wait 2s → SIGKILL
+   * WHY: a wedged downstream child (e.g. basic-memory stuck on a lock) can make
+   * the SDK's `client.close()` / `transport.close()` block indefinitely. Before
+   * this bound, that hung the whole disconnect() BEFORE the SIGTERM→SIGKILL step
+   * ran, so the child orphaned anyway. We cap the close and then proceed to kill
+   * the underlying PID regardless.
+   */
+  private async closeWithTimeout(
+    close: () => Promise<void>,
+    timeoutMs: number,
+    label: string
+  ): Promise<void> {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const timeout = new Promise<void>((resolve) => {
+      timer = setTimeout(() => {
+        console.error(`⚠️  ${label} did not close within ${timeoutMs}ms — proceeding to terminate`);
+        resolve();
+      }, timeoutMs);
+    });
+    try {
+      await Promise.race([
+        close().catch((error) => console.error(`Error closing ${label}:`, error)),
+        timeout,
+      ]);
+    } finally {
+      if (timer) {
+        clearTimeout(timer);
+      }
+    }
+  }
+
+  /**
+   * Disconnect all clients and kill child processes.
+   *
+   * Graceful shutdown per child: SIGTERM → poll for exit → SIGKILL once the
+   * configured grace window (CODE_EXECUTOR_CHILD_SHUTDOWN_TIMEOUT_MS, default
+   * 30s) elapses. `client.close()` is bounded (CODE_EXECUTOR_CLIENT_CLOSE_TIMEOUT_MS)
+   * so a wedged child cannot stall the kill sequence.
    */
   async disconnect(): Promise<void> {
-    // Close MCP clients
-    const disconnections = Array.from(this.clients.values()).map(
-      async (client) => {
-        try {
-          await client.close();
-        } catch (error) {
-          console.error('Error disconnecting client:', error);
-        }
-      }
-    );
+    const closeTimeoutMs = getClientCloseTimeoutMs();
+    const childTimeoutMs = getChildShutdownTimeoutMs();
+    const logToStderr = (message: string): void => console.error(message);
 
+    // Close MCP clients — bounded, so a wedged client cannot stall the kill step.
+    const disconnections = Array.from(this.clients.values()).map((client) =>
+      this.closeWithTimeout(() => client.close(), closeTimeoutMs, 'MCP client')
+    );
     await Promise.all(disconnections);
 
-    // Kill child processes (STDIO servers only)
-    const processCleanup = Array.from(this.processes.values()).map(
-      async (processInfo) => {
-        try {
-          const { pid, serverName } = processInfo;
-
-          // Try graceful shutdown (SIGTERM)
-          try {
-            process.kill(pid, 'SIGTERM');
-            console.error(`✓ Sent SIGTERM to ${serverName} (PID ${pid})`);
-
-            // Wait 2 seconds for graceful shutdown
-            await new Promise((resolve) => setTimeout(resolve, 2000));
-
-            // Check if process still exists
-            try {
-              process.kill(pid, 0); // Signal 0 checks existence
-              // Process still alive, force kill
-              process.kill(pid, 'SIGKILL');
-              console.error(`⚠️  Force killed ${serverName} (PID ${pid}) with SIGKILL`);
-            } catch {
-              // Process already exited
-              console.error(`✓ ${serverName} (PID ${pid}) exited gracefully`);
-            }
-          } catch (error) {
-            // Process might already be dead, safe to ignore ESRCH (No such process)
-            // TYPE-001 fix: Use isErrnoException type guard instead of unsafe cast
-            if (!isErrnoException(error) || error.code !== 'ESRCH') {
-              console.error(`Error killing ${serverName} (PID ${pid}):`, error);
-            }
-          }
-        } catch (error) {
-          console.error('Error during process cleanup:', error);
-        }
-      }
+    // Kill tracked STDIO child processes (graceful → force after grace window).
+    const processCleanup = Array.from(this.processes.values()).map(({ pid, serverName }) =>
+      killProcessGracefully(pid, {
+        timeoutMs: childTimeoutMs,
+        logger: logToStderr,
+        serverName,
+      })
     );
-
     await Promise.all(processCleanup);
 
-    // Close any transports whose connect() is still in flight (mid-init shutdown).
+    // Close transports whose connect() is still in flight (mid-init shutdown).
     // These are not yet in `processes`, so without this their children would leak.
-    const pendingCleanup = Array.from(this.pendingStdioTransports).map(
-      async (transport) => {
-        const pid = transport.pid;
-        try {
-          await transport.close();
-        } catch {
-          // best effort
-        }
-        if (pid != null) {
-          try {
-            process.kill(pid, 'SIGKILL');
-          } catch {
-            // already gone / not permitted
-          }
-        }
+    const pendingCleanup = Array.from(this.pendingStdioTransports).map(async (transport) => {
+      const pid = transport.pid;
+      await this.closeWithTimeout(() => transport.close(), closeTimeoutMs, 'pending transport');
+      if (pid != null) {
+        await killProcessGracefully(pid, {
+          timeoutMs: childTimeoutMs,
+          logger: logToStderr,
+          serverName: 'pending-transport',
+        });
       }
-    );
+    });
     await Promise.all(pendingCleanup);
     this.pendingStdioTransports.clear();
 

@@ -13,10 +13,11 @@ import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import type { RequestHandlerExtra } from '@modelcontextprotocol/sdk/shared/protocol.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { z } from 'zod';
-import { initConfig, isPythonEnabled, isRateLimitEnabled, getRateLimitConfig, shouldSkipDangerousPatternCheck } from './config/loader.js';
+import { initConfig, isPythonEnabled, isRateLimitEnabled, getRateLimitConfig, shouldSkipDangerousPatternCheck, getParentPollIntervalMs } from './config/loader.js';
 import { ExecuteTypescriptInputSchema, ExecutePythonInputSchema, ExecutionResultSchema } from './config/schemas.js';
 import { MCPClientPool } from './mcp/client-pool.js';
 import { watchClientDisconnect } from './mcp/stdin-watcher.js';
+import { watchParentExit } from './mcp/parent-watcher.js';
 import { redirectConsoleLogToStderr } from './utils/stdio-guard.js';
 import { SecurityValidator } from './validation/security-validator.js';
 import { ConnectionPool } from './mcp/connection-pool.js';
@@ -73,6 +74,8 @@ class CodeExecutorServer {
   // handlers await this before executing so downstream tools are ready (or have
   // been determined unavailable) by the time code runs.
   private poolReady: Promise<void> = Promise.resolve();
+  // Halts the active parent-liveness poll (see start()). Null until start() wires it.
+  private stopParentWatch: (() => void) | null = null;
 
   constructor() {
     // Initialize MCP server
@@ -737,6 +740,26 @@ Returns:
       });
     });
 
+    // Belt-and-suspenders to the stdin watcher above: actively poll parent
+    // liveness. stdin EOF can fail to arrive (host SIGKILLed, or a wrapper/child
+    // holds our stdin pipe open), and then the poll is the only signal that the
+    // host is gone. On POSIX, parent death reparents us to PID 1; that is what we
+    // watch for. See parent-watcher.ts.
+    const initialPpid = process.ppid;
+    this.stopParentWatch = watchParentExit({
+      getPpid: () => process.ppid,
+      initialPpid,
+      intervalMs: getParentPollIntervalMs(),
+      isPosix: process.platform !== 'win32',
+      onParentExit: (reason) => {
+        console.error(`Parent process gone (${reason}) — initiating shutdown...`);
+        void this.shutdown().catch((error) => {
+          console.error('Error during parent-exit-triggered shutdown:', error);
+          process.exit(1);
+        });
+      },
+    });
+
     console.error('Code Executor MCP Server started successfully (downstream MCP pool initializing in background)');
 
     // Initialize MCP client pool in the background. Tool handlers await
@@ -808,6 +831,13 @@ Returns:
       return;
     }
     this.shutdownInProgress = true;
+
+    // Stop the parent-liveness poll — shutdown is underway (its internal guard
+    // also fires onParentExit at most once, so this is hygiene, not correctness).
+    if (this.stopParentWatch) {
+      this.stopParentWatch();
+      this.stopParentWatch = null;
+    }
 
     const shutdownStart = Date.now();
 
@@ -885,6 +915,9 @@ const handleShutdownSignal = async (signal: string) => {
 
 process.on('SIGINT', () => void handleShutdownSignal('SIGINT'));
 process.on('SIGTERM', () => void handleShutdownSignal('SIGTERM'));
+// SIGHUP: controlling terminal / session leader went away (a common parent-death
+// signal). Treat it as a graceful shutdown rather than the default (terminate).
+process.on('SIGHUP', () => void handleShutdownSignal('SIGHUP'));
 
 // Synchronous last-resort cleanup. If the process exits without the async
 // graceful path completing (e.g. host sends SIGKILL after a timeout, or an
