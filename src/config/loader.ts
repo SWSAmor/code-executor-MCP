@@ -460,3 +460,90 @@ export function getDockerContainer(): string | undefined {
 // (will be removed in v2.0)
 export const DEFAULT_TIMEOUT_MS = 30000;
 export const MAX_TIMEOUT_MS = 300000;
+
+/**
+ * Lifecycle / shutdown timeout knobs.
+ *
+ * These govern graceful self-shutdown and downstream child cleanup:
+ *   - CHILD_SHUTDOWN: SIGTERM→SIGKILL grace per spawned child (default 30s).
+ *   - PARENT_POLL: cadence of the parent-liveness poll (default 2s).
+ *   - CLIENT_CLOSE: per-client close() timeout so a wedged child cannot stall
+ *     shutdown before the kill sequence runs (default 2s).
+ */
+export const DEFAULT_CHILD_SHUTDOWN_TIMEOUT_MS = 30_000;
+const MIN_CHILD_SHUTDOWN_TIMEOUT_MS = 1_000;
+const MAX_CHILD_SHUTDOWN_TIMEOUT_MS = 300_000; // 5 min ceiling
+
+export const DEFAULT_PARENT_POLL_INTERVAL_MS = 2_000;
+const MIN_PARENT_POLL_INTERVAL_MS = 500;
+const MAX_PARENT_POLL_INTERVAL_MS = 60_000;
+
+export const DEFAULT_CLIENT_CLOSE_TIMEOUT_MS = 2_000;
+const MIN_CLIENT_CLOSE_TIMEOUT_MS = 250;
+const MAX_CLIENT_CLOSE_TIMEOUT_MS = 30_000;
+
+/**
+ * Read a bounded integer env var for the shutdown path.
+ *
+ * **WHY clamp instead of throw:** unlike {@link getCharacterLimit} (read on the
+ * execution/output path, where fail-fast is fine), these knobs are read while
+ * SHUTTING DOWN. A throw here would abort the very cleanup the value configures
+ * and re-create the orphan it is meant to prevent. So a non-numeric value falls
+ * back to the default and an out-of-range value is clamped — shutdown never
+ * throws on a misconfigured timeout.
+ */
+function getBoundedEnvMs(
+  value: string | undefined,
+  defaultMs: number,
+  minMs: number,
+  maxMs: number
+): number {
+  if (!value) return defaultMs;
+  const parsed = parseInt(value, 10);
+  if (isNaN(parsed)) return defaultMs;
+  if (parsed < minMs) return minMs;
+  if (parsed > maxMs) return maxMs;
+  return parsed;
+}
+
+/**
+ * Grace period (ms) a spawned child gets after SIGTERM before it is SIGKILLed.
+ *
+ * Exit is polled, so a child that honors SIGTERM exits well within this window
+ * and is not delayed; the timeout only bounds a misbehaving/wedged child.
+ * Overridable via CODE_EXECUTOR_CHILD_SHUTDOWN_TIMEOUT_MS (1s..5min).
+ */
+export function getChildShutdownTimeoutMs(): number {
+  return getBoundedEnvMs(
+    process.env.CODE_EXECUTOR_CHILD_SHUTDOWN_TIMEOUT_MS,
+    DEFAULT_CHILD_SHUTDOWN_TIMEOUT_MS,
+    MIN_CHILD_SHUTDOWN_TIMEOUT_MS,
+    MAX_CHILD_SHUTDOWN_TIMEOUT_MS
+  );
+}
+
+/**
+ * Cadence (ms) of the active parent-liveness poll.
+ * Overridable via CODE_EXECUTOR_PARENT_POLL_INTERVAL_MS (0.5s..60s).
+ */
+export function getParentPollIntervalMs(): number {
+  return getBoundedEnvMs(
+    process.env.CODE_EXECUTOR_PARENT_POLL_INTERVAL_MS,
+    DEFAULT_PARENT_POLL_INTERVAL_MS,
+    MIN_PARENT_POLL_INTERVAL_MS,
+    MAX_PARENT_POLL_INTERVAL_MS
+  );
+}
+
+/**
+ * Per-client close() timeout (ms) during shutdown.
+ * Overridable via CODE_EXECUTOR_CLIENT_CLOSE_TIMEOUT_MS (0.25s..30s).
+ */
+export function getClientCloseTimeoutMs(): number {
+  return getBoundedEnvMs(
+    process.env.CODE_EXECUTOR_CLIENT_CLOSE_TIMEOUT_MS,
+    DEFAULT_CLIENT_CLOSE_TIMEOUT_MS,
+    MIN_CLIENT_CLOSE_TIMEOUT_MS,
+    MAX_CLIENT_CLOSE_TIMEOUT_MS
+  );
+}

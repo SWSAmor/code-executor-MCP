@@ -137,17 +137,45 @@ AbortController-based kill in the MCP SDK's stdio transport is not reliable unde
 Bun. The ancestry walk uses `ps`; on platforms without it (Windows) the guard is
 best-effort and simply does not engage.
 
+## Parent-liveness watchdog and graceful child cleanup
+
+`stdin` EOF (see `src/mcp/stdin-watcher.ts`) is the primary signal that the MCP
+host is gone, but it is not always delivered: the host can be SIGKILLed, or a
+launcher/wrapper (or a child that inherited fd 0) can hold the write end of our
+stdin pipe open, so the EOF never arrives. Without a second signal the server —
+and every downstream MCP child it spawned — orphans forever.
+
+- **Active parent poll** (`src/mcp/parent-watcher.ts`): on POSIX a process whose
+  parent dies is reparented to PID 1, so a change in `process.ppid` away from its
+  startup value is a reliable, pipe-independent "parent is gone" signal. The poll
+  is wired in `start()` and stopped in `shutdown()`; it is a no-op on Windows and
+  when launched directly by init (`ppid <= 1`), to avoid false positives.
+- **SIGHUP** (controlling terminal / session leader gone) is treated as a
+  graceful shutdown rather than the default terminate.
+- **Bounded graceful child kill** (`src/mcp/process-killer.ts`): `disconnect()`
+  sends SIGTERM, polls for exit, and SIGKILLs only once a configurable grace
+  window elapses (a child that honors SIGTERM is not delayed). `client.close()` /
+  `transport.close()` are bounded so a wedged child cannot stall the kill
+  sequence before it runs.
+
 ## Configuration
 
 | Env var | Default | Purpose |
 |---|---|---|
 | `POOL_CONNECT_TIMEOUT_MS` | `15000` | Per-downstream-server connect timeout (1000–120000). |
 | `CODE_EXECUTOR_ALLOW_NESTED` | unset | Set to `1`/`true` to disable the ancestry leaf-mode guard. |
+| `CODE_EXECUTOR_PARENT_POLL_INTERVAL_MS` | `2000` | Cadence of the parent-liveness poll (500–60000). |
+| `CODE_EXECUTOR_CHILD_SHUTDOWN_TIMEOUT_MS` | `30000` | SIGTERM→SIGKILL grace per downstream child (1000–300000). |
+| `CODE_EXECUTOR_CLIENT_CLOSE_TIMEOUT_MS` | `2000` | Per-client `close()` timeout during shutdown (250–30000). |
 
 ## Verification
 
 Unit tests: `tests/recursion-guard.test.ts` (self-exclusion + leaf mode +
-override), `tests/pool-config-validation.test.ts` (`connectTimeoutMs`).
+override), `tests/pool-config-validation.test.ts` (`connectTimeoutMs`),
+`tests/parent-watcher.test.ts` (ppid reparent detection),
+`tests/process-killer.test.ts` (graceful → force kill), `tests/shutdown-config.test.ts`
+(clamped shutdown env knobs), `tests/integration/orphan-cleanup.test.ts`
+(real-binary stdin-close and parent-death child reaping).
 
 Manual, on the compiled binary: confirmed the transport connects before pool
 init; a hung server is timed out and its child killed; a top-level instance runs
